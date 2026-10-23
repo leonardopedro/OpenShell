@@ -602,15 +602,27 @@ mount_virtiofs_shares() {
     [ -s "$manifest" ] || return 0
 
     ts "mounting virtiofs shares"
-    local tag target mode mount_opts guest_target owner
+    local tag target mode dax mount_opts guest_target owner
     owner="$(sandbox_owner)"
-    while IFS=$'\t' read -r tag target mode; do
+    while IFS=$'\t' read -r tag target mode dax; do
         [ -n "$tag" ] || continue
         case "$mode" in
             ro)  mount_opts="-o ro" ;;
             rw)  mount_opts="" ;;
             *)
                 ts "FATAL: unknown virtiofs mount mode '${mode}' for tag ${tag}"
+                exit 1
+                ;;
+        esac
+        case "$dax" in
+            "") ;;
+            dax)
+                # DAX window share: map the host file pages into the guest
+                # address space instead of copying them into the page cache.
+                mount_opts="${mount_opts} -o dax"
+                ;;
+            *)
+                ts "FATAL: unknown virtiofs dax flag '${dax}' for tag ${tag}"
                 exit 1
                 ;;
         esac

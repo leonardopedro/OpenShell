@@ -47,6 +47,9 @@ pub struct VmLaunchConfig {
     pub kernel_image: Option<PathBuf>,
     pub vcpus: u8,
     pub mem_mib: u32,
+    /// DAX window size per virtiofs share, in MiB. `None` keeps libkrun's
+    /// default non-DAX sharing (guest copies pages into its page cache).
+    pub dax_window_mib: Option<u64>,
     pub exec_path: String,
     pub args: Vec<String>,
     pub env: Vec<String>,
@@ -352,7 +355,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 
     for mount in &config.mounts {
-        vm.add_virtiofs(&mount.tag, &mount.host_path, mount.read_only)?;
+        vm.add_virtiofs(
+            &mount.tag,
+            &mount.host_path,
+            mount.read_only,
+            config.dax_window_mib,
+        )?;
     }
 
     vm.set_console_output(&config.console_output)?;
@@ -679,12 +687,27 @@ impl VmContext {
         )
     }
 
-    fn add_virtiofs(&self, tag: &str, host_path: &Path, read_only: bool) -> Result<(), String> {
+    fn add_virtiofs(
+        &self,
+        tag: &str,
+        host_path: &Path,
+        read_only: bool,
+        dax_window_mib: Option<u64>,
+    ) -> Result<(), String> {
         // KRUN_SEMANTICS_LINUX_SIMPLIFIED: guest ownership is not recorded on
         // host files and permission bits are stored on the host directly, not
         // in extended attributes. Only the macOS passthrough applies that; on
         // Linux the mode just disables attribute caching and idmapped mounts.
         const SEMANTICS_SIMPLIFIED: u32 = 1;
+        // shm_size is libkrun's DAX window knob: > 0 maps the share into a
+        // guest-visible window so file I/O bypasses the guest page cache
+        // (single physical copy on the host) instead of copying pages in.
+        let shm_size = match dax_window_mib {
+            Some(mib) => mib
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| format!("DAX window size {mib} MiB is too large"))?,
+            None => 0,
+        };
         let tag_c = CString::new(tag).map_err(|e| format!("invalid virtiofs tag: {e}"))?;
         let path_c = path_to_cstring(host_path)?;
         let add_virtiofs4 = *self.krun.krun_add_virtiofs4.as_ref().map_err(|err| {
@@ -696,7 +719,7 @@ impl VmContext {
                     self.ctx_id,
                     tag_c.as_ptr(),
                     path_c.as_ptr(),
-                    0,
+                    shm_size,
                     read_only,
                     SEMANTICS_SIMPLIFIED,
                 )
@@ -811,6 +834,7 @@ mod tests {
             kernel_image: None,
             vcpus: 2,
             mem_mib: 2048,
+            dax_window_mib: None,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
             args: Vec::new(),
             env: vec!["OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()],

@@ -200,6 +200,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_OVERLAY_DISK_MIB", default_value_t = 4096)]
     overlay_disk_mib: u64,
 
+    /// DAX window size in MiB for virtiofs shares (libkrun backend). When
+    /// set, each bind mount gets a DAX window so guest file I/O maps host
+    /// pages directly instead of copying them into the guest page cache.
+    /// Unset keeps the default copying behaviour.
+    #[arg(long, env = "OPENSHELL_VM_DAX_WINDOW_MIB")]
+    dax_window_mib: Option<u64>,
+
     #[arg(long, env = "OPENSHELL_VM_GPU")]
     gpu: bool,
 
@@ -268,6 +275,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_mount: Vec<String>,
+
+    #[arg(long, hide = true)]
+    vm_dax_window_mib: Option<u64>,
 }
 
 #[tokio::main]
@@ -335,6 +345,7 @@ async fn main() -> Result<()> {
         vcpus: args.vcpus,
         mem_mib: args.mem_mib,
         overlay_disk_mib: args.overlay_disk_mib,
+        dax_window_mib: args.dax_window_mib,
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
@@ -660,6 +671,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         kernel_image: args.vm_kernel_image.clone(),
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
+        dax_window_mib: args.vm_dax_window_mib,
         exec_path,
         args: Vec::new(),
         env: args.vm_env.clone(),

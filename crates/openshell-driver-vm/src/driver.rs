@@ -320,6 +320,11 @@ pub struct VmDriverConfig {
     pub vcpus: u8,
     pub mem_mib: u32,
     pub overlay_disk_mib: u64,
+    /// DAX window size in MiB for virtiofs shares (libkrun backend). When
+    /// set, each share gets a DAX window so guest I/O maps host file pages
+    /// directly instead of copying them into the guest page cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dax_window_mib: Option<u64>,
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
@@ -376,6 +381,7 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("bootstrap_image", &self.bootstrap_image)
             .field("log_level", &self.log_level)
             .field("krun_log_level", &self.krun_log_level)
+        .field("dax_window_mib", &self.dax_window_mib)
             .field("vcpus", &self.vcpus)
             .field("mem_mib", &self.mem_mib)
             .field("overlay_disk_mib", &self.overlay_disk_mib)
@@ -449,6 +455,7 @@ impl Default for VmDriverConfig {
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
             overlay_disk_mib: DEFAULT_OVERLAY_DISK_MIB,
+            dax_window_mib: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -1612,8 +1619,12 @@ impl VmDriver {
         // image-supplied manifest in the lowerdir can never drive guest mounts.
         if let Err(err) = inject_guest_init_dropins(&overlay_disk, &plan.guest_init_dropins)
             .and_then(|()| {
-                inject_guest_mount_manifest(&overlay_disk, &driver_config.mounts)
-                    .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))
+                inject_guest_mount_manifest(
+                    &overlay_disk,
+                    &driver_config.mounts,
+                    self.config.dax_window_mib,
+                )
+                .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))
             })
         {
             self.lifecycle_extensions
@@ -1763,6 +1774,9 @@ impl VmDriver {
         }
         for env in sandbox_owner_state.guest_environment() {
             command.arg("--vm-env").arg(env);
+        }
+        if let Some(dax_window_mib) = self.config.dax_window_mib {
+            command.arg("--vm-dax-window-mib").arg(dax_window_mib.to_string());
         }
         for (i, mount) in driver_config.mounts.iter().enumerate() {
             command.arg("--vm-mount").arg(format!(
@@ -5161,17 +5175,29 @@ fn vm_mount_mode(read_only: bool) -> &'static str {
     if read_only { "ro" } else { "rw" }
 }
 
-/// Guest manifest consumed by `mount_virtiofs_shares`: `tag\ttarget\tmode`.
-fn render_mount_manifest(mounts: &[VmMountConfig]) -> String {
+/// Guest manifest consumed by `mount_virtiofs_shares`: `tag\ttarget\tmode`,
+/// with a fourth `dax` column per share when a DAX window is enabled. The
+/// no-DAX rendering stays byte-identical to the three-column format.
+fn render_mount_manifest(mounts: &[VmMountConfig], dax_window_mib: Option<u64>) -> String {
     let mut manifest = String::new();
     for (i, mount) in mounts.iter().enumerate() {
-        writeln!(
-            manifest,
-            "{}\t{}\t{}",
-            virtiofs_tag(i),
-            driver_mounts::normalize_mount_target(&mount.target),
-            vm_mount_mode(mount.read_only)
-        )
+        if dax_window_mib.is_some() {
+            writeln!(
+                manifest,
+                "{}\t{}\t{}\tdax",
+                virtiofs_tag(i),
+                driver_mounts::normalize_mount_target(&mount.target),
+                vm_mount_mode(mount.read_only)
+            )
+        } else {
+            writeln!(
+                manifest,
+                "{}\t{}\t{}",
+                virtiofs_tag(i),
+                driver_mounts::normalize_mount_target(&mount.target),
+                vm_mount_mode(mount.read_only)
+            )
+        }
         .expect("write to String cannot fail");
     }
     manifest
@@ -7195,8 +7221,9 @@ fn inject_guest_boundary_bundle(
 fn inject_guest_mount_manifest(
     overlay_disk: &Path,
     mounts: &[VmMountConfig],
+    dax_window_mib: Option<u64>,
 ) -> Result<(), String> {
-    let manifest = render_mount_manifest(mounts);
+    let manifest = render_mount_manifest(mounts, dax_window_mib);
     let guest_path = overlay_upper_path("/.openshell/mounts.manifest");
     write_rootfs_image_file(overlay_disk, &guest_path, manifest.as_bytes())?;
     set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644)?;
@@ -14070,8 +14097,30 @@ while :; do sleep 0.05; done"#,
             },
         ];
         assert_eq!(
-            render_mount_manifest(&mounts),
+            render_mount_manifest(&mounts, None),
             "osfs0\t/sandbox/a\tro\nosfs1\t/sandbox/b\trw\n"
+        );
+    }
+
+    #[test]
+    fn vm_mount_manifest_marks_dax_column_when_window_enabled() {
+        let mounts = [
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/a".to_string(),
+                target: "/sandbox/a".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/b".to_string(),
+                target: "/sandbox/b".to_string(),
+                read_only: false,
+            },
+        ];
+        assert_eq!(
+            render_mount_manifest(&mounts, Some(128)),
+            "osfs0\t/sandbox/a\tro\tdax\nosfs1\t/sandbox/b\trw\tdax\n"
         );
     }
 }
