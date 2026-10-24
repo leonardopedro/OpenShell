@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# post-commit — remind that /etc/nixos pins THIS folder's content hash.
+#
+# /etc/nixos/openshell.nix pins this folder as
+#     builtins.getFlake "path:<this folder>?narHash=..."
+# using the PATH fetcher (whole directory, .git included), so any change
+# here — including every commit — changes the hash the next nixos-rebuild
+# will expect. Without a relock the rebuild fails with:
+#     error: NAR hash mismatch in input 'path:...openshell-nixos?narHash=...'
+# Re-lock before the next rebuild:
+#     sudo <this folder>/update-nixos.sh
+#
+# This hook only prints. It cannot and must not run nixos-rebuild itself
+# (hooks have no sudo). Installed at .git/hooks/post-commit as a symlink
+# to this file; git does not version .git/hooks, so this copy is the
+# source of truth.
+set -u
+
+# post-commit runs with cwd at the worktree top level; the fallback keeps
+# it working when executed by hand from elsewhere.
+FOLDER="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+command -v nix >/dev/null 2>&1 || exit 0
+
+# Fresh hash of the folder exactly as the path fetcher sees it now.
+HASH="$(nix flake prefetch "path:$FOLDER" --json 2>/dev/null |
+    sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')"
+[ -n "$HASH" ] || exit 0
+
+PIN="$(grep -o 'narHash=sha256-[^"?]*' /etc/nixos/openshell.nix 2>/dev/null |
+    head -1 | sed 's/narHash=//')"
+[ -n "$PIN" ] || exit 0   # module absent/not rendered yet — nothing to compare
+
+if [ "$PIN" = "$HASH" ]; then
+    echo "[openshell-nixos] /etc/nixos pin still matches this folder ($HASH)"
+else
+    echo "[openshell-nixos] /etc/nixos pin is stale after this commit —"
+    echo "  the next nixos-rebuild would fail with 'NAR hash mismatch'."
+    echo "  Re-lock first:  sudo $FOLDER/update-nixos.sh"
+fi

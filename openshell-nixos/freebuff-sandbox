@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# freebuff-sandbox — run Freebuff inside an OpenShell libkrun microVM, in
+# production, with maximum deduplication: nothing that exists on the host is
+# copied into the guest's disk image (RAM dedup is a different story — see
+# the /nix note below).
+#
+#   ./freebuff-sandbox [freebuff args...]
+#   PROJECTS_DIR=~/code SHARE_NIX_RW=1 SANDBOX_NAME=fb2 ./freebuff-sandbox
+#
+# The three mounts (x86_64 allows at most 3 per sandbox):
+#   /nix          ro   host Nix store  -> guest store (shared libs + nix pkgs;
+#                                   one physical copy on disk AND in RAM:
+#                                   the fork driver gives each share a DAX
+#                                   window, guest mounts dax=always (Route A,
+#                                   measured — see README). ksmd runs anyway
+#                                   (run=1).
+#   /var/lib/fnm  ro   the host's single node install incl. freebuff, opencode,
+#                                   repomix (one copy on disk; same RAM story)
+#   $PROJECTS_DIR rw   the code you actually want the agent to work on
+#
+# The guest command puts the shared node bin dir on PATH, points the linker at
+# the store's gcc-lib dir, and execs freebuff in $PROJECTS_DIR. Network still
+# goes through OpenShell's policy layer: the first run will ask you to approve
+# freebuff's egress endpoints (its self-updater also downloads the native
+# binary once, into the sandbox's own overlay).
+set -euo pipefail
+
+die() { printf 'freebuff-sandbox: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  command -v openshell >/dev/null 2>&1 || die "openshell CLI not on PATH (run: sudo ./install.sh — it lands in /run/current-system/sw/bin)"
+fi
+command -v node >/dev/null 2>&1 || die "node not on PATH on the host — the guest reuses the host's install, so it must exist here"
+command -v freebuff >/dev/null 2>&1 || die "freebuff not on PATH on the host — npm install -g freebuff first (dedup means: once, here)"
+
+# The real (multishell-shim-free) directory of the host's node toolchain.
+NODE_BIN_DIR="$(dirname "$(readlink -f "$(command -v node)")")"
+[[ -x "$NODE_BIN_DIR/freebuff" ]] || die "freebuff not next to node ($NODE_BIN_DIR) — unexpected install layout"
+
+# node is a Nix-built binary (fnm's downloads are the nixpkgs build), so it
+# links libatomic/libstdc++ out of /nix/store. On the host the dynamic linker
+# finds them via nix-ld's symlink farm; the plain-Ubuntu guest has no such
+# mechanism, and node dies with "libatomic.so.1: cannot open shared object
+# file" unless the store's gcc-lib dir is on LD_LIBRARY_PATH. Resolved on the
+# host (the store is mounted ro into the guest at the same path), so no store
+# path is hard-coded — it tracks whatever gcc lib the host's nix-ld points at.
+GCC_LIB="$(dirname "$(readlink -f "$(echo /nix/store/*-ld-library-path/share/nix-ld/lib)/libatomic.so.1" 2>/dev/null)" 2>/dev/null)"
+if [[ -z "$GCC_LIB" || ! -e "$GCC_LIB/libstdc++.so.6" ]]; then
+  # No nix-ld on this host: take the gcc-lib dir that actually provides the
+  # two libraries node needs (first hit in store order).
+  GCC_LIB="$(dirname "$(find /nix/store -maxdepth 3 -name 'libatomic.so.1' -path '*gcc-*-lib/*' 2>/dev/null | head -1)" 2>/dev/null)"
+fi
+[[ -e "$GCC_LIB/libatomic.so.1" && -e "$GCC_LIB/libstdc++.so.6" ]] ||
+  die "cannot locate the store's gcc-lib dir (libatomic + libstdc++) for the guest's node"
+
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
+SANDBOX_NAME="${SANDBOX_NAME:-freebuff}"
+SHARE_NIX_RW="${SHARE_NIX_RW:-0}"
+
+# The sandbox policy (schema v1): the mounts below attach over virtiofs, but
+# *file access* inside the workload is gated by Landlock rules derived from
+# the policy's filesystem_policy — the built-in default only allows /sandbox
+# plus /bin /usr /lib /etc /tmp, so without this file every open() on the
+# shared mounts returns EACCES. Kept next to this launcher; pass your own
+# with POLICY_FILE=... if you fork the layout.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+POLICY_FILE="${POLICY_FILE:-$SCRIPT_DIR/sandbox-policy.yaml}"
+[[ -f "$POLICY_FILE" ]] || die "policy file not found: $POLICY_FILE (it lives next to this launcher)"
+
+[[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
+
+NIX_RO=true
+[[ "$SHARE_NIX_RW" == 1 ]] && NIX_RO=false
+
+# JSON built with plain string interpolation — all three inputs are absolute
+# host paths without quotes/backslashes in practice; refuse them otherwise.
+for p in "$PROJECTS_DIR" "$NODE_BIN_DIR"; do
+  [[ "$p" != *\"* && "$p" != *\\* ]] || die "path contains a quote/backslash, refusing to build mount JSON: $p"
+done
+
+MOUNTS="[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":$NIX_RO},"
+MOUNTS+="{\"type\":\"bind\",\"source\":\"/var/lib/fnm\",\"target\":\"/var/lib/fnm\",\"read_only\":true},"
+MOUNTS+="{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}]"
+
+# The guest shell: put the shared toolchain on PATH, point the linker at the
+# store's gcc-lib dir, cd to the shared workspace, then hand over to freebuff
+# with all arguments intact.
+GUEST_CMD="export PATH=$NODE_BIN_DIR:\$PATH; export LD_LIBRARY_PATH=$GCC_LIB:\${LD_LIBRARY_PATH:-}; cd /workspace 2>/dev/null || cd /; exec freebuff \"\$@\""
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q \\\n  -- sh -c %q sh %s\n' \
+    "$SANDBOX_NAME" "{\"vm\":{\"mounts\":$MOUNTS}}" "$POLICY_FILE" "$GUEST_CMD" "$*"
+  exit 0
+fi
+
+exec openshell sandbox create --name "$SANDBOX_NAME" \
+  --driver-config-json "{\"vm\":{\"mounts\":$MOUNTS}}" \
+  --policy "$POLICY_FILE" \
+  -- sh -c "$GUEST_CMD" sh "$@"

@@ -1,0 +1,64 @@
+# gateway.toml — OpenShell gateway template (schema v2, OpenShell 0.1.5).
+#
+# install.sh renders this to ~/.config/openshell/gateway.toml, substituting
+# @HOME@ with the real home of the user running the gateway. The rendered
+# file has been validated with `openshell-gateway config preflight`
+# (exit 0) against the packaged v0.1.5 gateway.
+#
+# What this enables, in one breath: the libkrun MicroVM compute driver
+# (opt-in — it is never auto-detected) with per-sandbox virtiofs host
+# directory shares, so guest microVMs and the host share the same files
+# instead of copying them.
+
+[openshell]
+version = 2
+
+[openshell.gateway]
+name = "nixos-local"
+# Explicit: the VM driver is never auto-detected (docs: Sandbox Runtimes).
+compute_driver = "vm"
+
+[openshell.drivers.vm]
+# Sandbox + bootstrap rootfs. The driver pulls registry images itself over
+# the host network (digest-verified) — no Docker daemon is needed for this
+# default; a local Docker/Podman socket is only consulted for *local* images.
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
+vcpus = 4
+mem_mib = 2048
+overlay_disk_mib = 4096
+# Absolute, user-owned state: per-sandbox overlay disks, image cache and
+# the compute-driver socket. The upstream default is cwd-relative
+# (target/openshell-vm-driver), which would land wherever the systemd user
+# service happens to start from.
+state_dir = "@HOME@/.local/state/openshell/vm-driver"
+# Fork-built DAX-enabled driver (Route A: the driver passes a DAX window
+# size to libkrun and the guest mounts those shares with -o dax). The
+# gateway resolves driver_dir first; the packaged upstream driver stays as
+# fallback. install.sh keeps this copy current with target/release.
+driver_dir = "@HOME@/.local/libexec/openshell"
+
+# Workload identity, pinned to the gateway user's own uid:gid (install.sh
+# substitutes `id -u`/`id -g` of the gateway user). On the VM driver this
+# resolves the sandbox overlay owner AND the identity the workload runs as
+# (docs: Sandbox Runtimes → MicroVM; `openshell sandbox get` reports it as
+# the WorkloadIdentity condition). It is the documented prerequisite for
+# creating files in a read-write bind mount with a non-root gateway: with
+# it, the workload user, the overlay owner and the host files' owner are
+# the same uid, so the shared workspace is genuinely writable. 0 is
+# rejected (root); the range is 1..4294967294.
+sandbox_uid = @SANDBOX_UID@
+sandbox_gid = @SANDBOX_GID@
+
+# --- The sharing enablement (this folder's whole point) -------------------
+# Per-sandbox host directory shares over virtiofs (libkrun backend only;
+# max 3 mounts per sandbox on x86_64). The companion `freebuff-sandbox`
+# launcher passes exactly three: /nix (ro), /var/lib/fnm (ro) and
+# ~/Projects (rw). OpenShell requires all three of these opt-ins for bind
+# mounts — see the trust notes in README.md before weakening them.
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.vm.resource_admission]
+# Bind mounts are rejected while resource admission is enabled (upstream
+# behavior); this is the documented companion switch to the two above.
+enabled = false

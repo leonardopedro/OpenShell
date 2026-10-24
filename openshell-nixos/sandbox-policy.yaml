@@ -1,0 +1,65 @@
+# sandbox-policy.yaml — per-sandbox policy for the freebuff microVMs
+# (OpenShell schema v1, checked against docs v0.1.5 "Policy Schema Reference"
+# and "Default Policy and Baseline Paths").
+#
+# Why this file exists: the virtiofs bind mounts attach inside the guest, but
+# the workload's *file access* is gated by Landlock rules derived from the
+# policy's filesystem_policy. The built-in default allows the workdir plus
+# /bin /usr /lib /etc /tmp, so the three shared mounts sat outside the
+# allowed set and every open() on them returned EACCES even though the mounts
+# were live and owner-DAC permitted access. This policy adds exactly the
+# three mount targets; freebuff-sandbox passes it with `--policy`.
+#
+# The system paths below are re-listed deliberately: a policy with at least
+# one network rule gets the documented baseline (/usr /lib /etc /app /var/log
+# /proc /dev/urandom + rw /tmp /dev/null) added automatically, but this
+# policy defines no network rules (egress stays denied until approved via the
+# policy-advisor flow), so nothing is auto-added and the guest shell would
+# lose /bin /usr /lib without these. Listing them as read_only keeps them
+# read-only even once networking adds the baseline later.
+#
+# Companion setting (the other half of the fix): the gateway config sets
+# sandbox_uid/sandbox_gid under [openshell.drivers.vm] to the gateway user's
+# own uid:gid, which pins the VM driver's resolved overlay owner and workload
+# identity to that same uid — the documented prerequisite for creating files
+# in a rw bind mount with a non-root gateway. install.sh renders those two
+# values into the gateway.toml template.
+version: 1
+
+filesystem_policy:
+  # With a filesystem_policy section present, include_workdir defaults to
+  # false, so set it explicitly to keep the /sandbox workdir read-write.
+  include_workdir: true
+  read_only:
+    # System paths the workload needs to boot and exec (normally the default
+    # policy's set; re-listed because there is no network rule to add them).
+    - /bin
+    - /usr
+    - /lib
+    - /lib64
+    - /etc
+    - /proc
+    - /var/log
+    - /dev/urandom
+    # The three shared mounts (host -> guest over virtiofs).
+    - /nix          # host Nix store (ro): shared libs + node toolchain
+    - /var/lib/fnm  # host node install incl. freebuff (ro)
+  read_write:
+    - /tmp
+    - /dev/null
+    - /workspace    # $PROJECTS_DIR (rw): the agent's working tree
+    # read_write cannot contain "/" (schema rule); /workspace is fine.
+
+landlock:
+  # Fail the sandbox start if none of the paths can be applied, instead of
+  # silently degrading to a VM with dead mounts. The mandatory /.openshell
+  # baseline already requires Landlock ABI v3 on every driver, so this adds
+  # no new kernel requirement.
+  compatibility: hard_requirement
+
+# No `process` section: on the VM driver the default identity is the driver's
+# resolved overlay owner, which the gateway's sandbox_uid/gid pins to the
+# gateway user. An explicit selector would have to match that same owner.
+#
+# No `network_policies` section: egress stays denied until approved
+# per-sandbox (policy-advisor flow; see README.md).
