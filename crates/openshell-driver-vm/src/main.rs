@@ -249,6 +249,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_ENABLE_BIND_MOUNTS", default_value_t = false)]
     enable_bind_mounts: bool,
 
+    /// Inject the shared Nix binary-cache `NIX_CONFIG` into guests.
+    #[arg(long, env = "OPENSHELL_VM_GUEST_NIX_CACHE", default_value_t = false)]
+    guest_nix_cache: bool,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -369,6 +373,7 @@ async fn main() -> Result<()> {
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
         enable_bind_mounts: args.enable_bind_mounts,
+        guest_nix_cache: args.guest_nix_cache,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;

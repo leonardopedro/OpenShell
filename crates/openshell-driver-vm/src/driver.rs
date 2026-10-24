@@ -362,6 +362,11 @@ pub struct VmDriverConfig {
 
     #[serde(default)]
     pub enable_bind_mounts: bool,
+    /// Opt in to injecting the shared Nix binary-cache `NIX_CONFIG` into guests
+    /// (guest-cache-design.md delta 2). Off by default: guests keep resolving
+    /// packages straight out of the read-only `/nix` mount and their own store.
+    #[serde(default)]
+    pub guest_nix_cache: bool,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -428,6 +433,7 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
             .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
+            .field("guest_nix_cache", &self.guest_nix_cache)
             .finish()
     }
 }
@@ -471,6 +477,7 @@ impl Default for VmDriverConfig {
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
             enable_bind_mounts: false,
+            guest_nix_cache: false,
         }
     }
 }
@@ -6339,12 +6346,32 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    if config.guest_nix_cache {
+        environment.insert("NIX_CONFIG".to_string(), guest_nix_config());
+    }
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
+}
+
+/// Shared Nix binary-cache configuration projected into opted-in guests.
+///
+/// Substituters are a single operator-owned endpoint; trusted-public-keys are
+/// fixed here so a guest verifies cache artifacts before adding them to its
+/// store.
+fn guest_nix_config() -> String {
+    let substituters = "https://cache.nixos.org";
+    let trusted_public_keys = "cache.nixos.org-1:6NCH59123qzKJitfolKDcRGf3qLhpGdbzLq6Xq4iNVM=";
+    format!(
+        "substituters = {substituters}\n\
+         trusted-public-keys = {trusted_public_keys}\n\
+         trusted-substituters = {substituters}\n\
+         connect-timeout = 5\n\
+         fallback = true"
+    )
 }
 
 fn sandboxes_root_dir(root: &Path) -> PathBuf {
@@ -7913,6 +7940,47 @@ mod tests {
         )
         .expect("open test socket root");
         (dir, Arc::new(fd))
+    }
+
+    fn guest_env_config(guest_nix_cache: bool) -> VmDriverConfig {
+        VmDriverConfig {
+            guest_nix_cache,
+            ..VmDriverConfig::default()
+        }
+    }
+
+    #[test]
+    fn guest_nix_cache_defaults_off_and_env_omits_nix_config() {
+        let sandbox = Sandbox::default();
+        let config = guest_env_config(false);
+        let env = build_guest_environment(&sandbox, &config);
+        assert!(
+            !env.iter().any(|pair| pair.starts_with("NIX_CONFIG=")),
+            "default config must not inject NIX_CONFIG: {env:?}"
+        );
+    }
+
+    #[test]
+    fn guest_nix_cache_opt_in_injects_substituter_config() {
+        let sandbox = Sandbox::default();
+        let config = guest_env_config(true);
+        let env = build_guest_environment(&sandbox, &config);
+        let nix_config = env
+            .iter()
+            .find_map(|pair| pair.strip_prefix("NIX_CONFIG="))
+            .expect("opted-in guest receives NIX_CONFIG");
+        assert!(nix_config.contains("substituters = https://cache.nixos.org"));
+        assert!(nix_config.contains("trusted-public-keys = cache.nixos.org-1:"));
+        assert!(nix_config.contains("fallback = true"));
+    }
+
+    #[test]
+    fn guest_env_stays_sorted_with_nix_config_opt_in() {
+        let sandbox = Sandbox::default();
+        let env = build_guest_environment(&sandbox, &guest_env_config(true));
+        let mut sorted = env.clone();
+        sorted.sort();
+        assert_eq!(env, sorted);
     }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
