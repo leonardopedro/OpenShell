@@ -362,9 +362,11 @@ pub struct VmDriverConfig {
 
     #[serde(default)]
     pub enable_bind_mounts: bool,
-    /// Opt in to injecting the shared Nix binary-cache `NIX_CONFIG` into guests
-    /// (guest-cache-design.md delta 2). Off by default: guests keep resolving
-    /// packages straight out of the read-only `/nix` mount and their own store.
+    /// Opt in to writing the shared Nix binary-cache configuration into
+    /// guests as `/etc/nix/nix.conf`, injected host-side into the overlay
+    /// (guest-cache-design.md deltas 2 + 3). Off by default: guests keep
+    /// resolving packages straight out of the read-only `/nix` mount and
+    /// their own store.
     #[serde(default)]
     pub guest_nix_cache: bool,
 }
@@ -1633,6 +1635,7 @@ impl VmDriver {
                 )
                 .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))
             })
+            .and_then(|()| inject_guest_nix_conf(&overlay_disk, &self.config))
         {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
@@ -6346,9 +6349,11 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
-    if config.guest_nix_cache {
-        environment.insert("NIX_CONFIG".to_string(), guest_nix_config());
-    }
+    // `guest_nix_cache` deliberately does NOT inject `NIX_CONFIG` here:
+    // guest environment travels on libkrun's kernel-command-line encoding,
+    // where multi-line values abort the VMM build (`InvalidAscii` panic).
+    // The opt-in injects `/etc/nix/nix.conf` into the guest overlay instead
+    // (see `inject_guest_nix_conf`).
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
@@ -6357,12 +6362,13 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         .collect()
 }
 
-/// Shared Nix binary-cache configuration projected into opted-in guests.
+/// Shared Nix binary-cache configuration written into opted-in guests as
+/// `/etc/nix/nix.conf`.
 ///
 /// Substituters are a single operator-owned endpoint; trusted-public-keys are
 /// fixed here so a guest verifies cache artifacts before adding them to its
 /// store.
-fn guest_nix_config() -> String {
+fn guest_nix_conf() -> String {
     let substituters = "https://cache.nixos.org";
     let trusted_public_keys = "cache.nixos.org-1:6NCH59123qzKJitfolKDcRGf3qLhpGdbzLq6Xq4iNVM=";
     format!(
@@ -6372,6 +6378,39 @@ fn guest_nix_config() -> String {
          connect-timeout = 5\n\
          fallback = true"
     )
+}
+
+/// Guest path of the shared Nix binary-cache configuration.
+const GUEST_NIX_CONF_PATH: &str = "/etc/nix/nix.conf";
+
+/// Inject [`guest_nix_conf`] into the guest overlay when `guest_nix_cache`
+/// is opted in.
+///
+/// This rides the same host-side channel as the boundary TLS material
+/// (`write_rootfs_image_file`), for two reasons: the `--vm-env` environment
+/// channel encodes values on the kernel command line, where a multi-line
+/// value aborts the VMM build with an `InvalidAscii` panic; and the guest's
+/// `/etc` is read-only while init drop-ins execute, so a boot-time script
+/// cannot create `/etc/nix` either.
+fn inject_guest_nix_conf(overlay_disk: &Path, config: &VmDriverConfig) -> Result<(), Status> {
+    if !config.guest_nix_cache {
+        return Ok(());
+    }
+    let contents = guest_nix_conf();
+    // The overlay image hosts the overlayfs upper dir under `/upper/`; a
+    // path written anywhere else never reaches the guest's merged root.
+    let image_path = overlay_upper_path(GUEST_NIX_CONF_PATH);
+    write_rootfs_image_file(overlay_disk, &image_path, contents.as_bytes()).map_err(|err| {
+        Status::internal(format!(
+            "write VM guest {GUEST_NIX_CONF_PATH} failed: {err}"
+        ))
+    })?;
+    set_rootfs_image_file_mode(overlay_disk, &image_path, 0o644).map_err(|err| {
+        Status::internal(format!(
+            "set VM guest {GUEST_NIX_CONF_PATH} mode failed: {err}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn sandboxes_root_dir(root: &Path) -> PathBuf {
@@ -7956,22 +7995,30 @@ mod tests {
         let env = build_guest_environment(&sandbox, &config);
         assert!(
             !env.iter().any(|pair| pair.starts_with("NIX_CONFIG=")),
-            "default config must not inject NIX_CONFIG: {env:?}"
+            "multi-line NIX_CONFIG on the --vm-env channel aborts the VMM; \
+             default config must not inject it: {env:?}"
         );
+        inject_guest_nix_conf(Path::new("/nonexistent/overlay.ext4"), &config)
+            .expect("disabled opt-in must not touch the overlay");
     }
 
     #[test]
-    fn guest_nix_cache_opt_in_injects_substituter_config() {
-        let sandbox = Sandbox::default();
-        let config = guest_env_config(true);
-        let env = build_guest_environment(&sandbox, &config);
-        let nix_config = env
-            .iter()
-            .find_map(|pair| pair.strip_prefix("NIX_CONFIG="))
-            .expect("opted-in guest receives NIX_CONFIG");
-        assert!(nix_config.contains("substituters = https://cache.nixos.org"));
-        assert!(nix_config.contains("trusted-public-keys = cache.nixos.org-1:"));
-        assert!(nix_config.contains("fallback = true"));
+    fn guest_nix_cache_opt_in_targets_nix_conf_with_shared_settings() {
+        // The overlay write itself is exercised end-to-end in a live VM;
+        // here we pin the destination and the settings payload.
+        assert_eq!(GUEST_NIX_CONF_PATH, "/etc/nix/nix.conf");
+        assert!(guest_env_config(true).guest_nix_cache);
+        let conf = guest_nix_conf();
+        assert!(conf.contains("substituters = https://cache.nixos.org"));
+        assert!(conf.contains("trusted-public-keys = cache.nixos.org-1:"));
+        assert!(conf.contains("trusted-substituters = https://cache.nixos.org"));
+        assert!(conf.contains("connect-timeout = 5"));
+        assert!(conf.contains("fallback = true"));
+        assert_eq!(
+            conf.lines().count(),
+            5,
+            "expected exactly five settings lines: {conf:?}"
+        );
     }
 
     #[test]
