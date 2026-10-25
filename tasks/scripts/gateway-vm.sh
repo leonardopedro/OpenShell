@@ -369,6 +369,14 @@ driver_dir = "${DRIVER_DIR}"
 state_dir = "${VM_DRIVER_STATE_DIR}"
 EOF
 
+# On Linux with a non-root gateway, pin the sandbox identity to the gateway
+# user (same rule as e2e/rust/e2e-vm.sh): a rootless virtiofsd cannot
+# setresgid() to a gid outside its own user namespace, so create/mkdir/symlink
+# by any other uid:gid in a read-write bind mount fail with EINVAL.
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" != "0" ]; then
+  printf 'sandbox_uid = %s\nsandbox_gid = %s\n' "$(id -u)" "$(id -g)" >>"${CONFIG_PATH}"
+fi
+
 # VM proxy settings become protected supervisor argv inside the guest. The
 # auth file content is copied into a 0600 overlay file by the driver and is
 # never printed by this task.
