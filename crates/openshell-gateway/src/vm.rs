@@ -126,6 +126,12 @@ pub struct VmComputeConfig {
     /// Allow bind-mounting host directories into VM sandboxes.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+
+    /// Default VM backend for sandboxes that do not select one via
+    /// `template.driver_config.vm.backend`: `libkrun`, `qemu`, or
+    /// `cloud-hypervisor`. Omit to keep the driver's historical default.
+    #[serde(default)]
+    pub default_vm_backend: Option<String>,
 }
 
 impl VmComputeConfig {
@@ -259,6 +265,7 @@ impl Default for VmComputeConfig {
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
             enable_bind_mounts: false,
+            default_vm_backend: None,
         }
     }
 }
@@ -582,6 +589,9 @@ pub async fn spawn(
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
     if vm_config.enable_bind_mounts {
         command.arg("--enable-bind-mounts");
+    }
+    if let Some(backend) = vm_config.default_vm_backend.as_deref() {
+        command.arg("--default-vm-backend").arg(backend);
     }
 
     let mut child = command.spawn().map_err(|e| {

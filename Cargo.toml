@@ -110,6 +110,12 @@ base64 = "0.22"
 
 # Crypto / Auth
 sha2 = "0.10"
+# Chutes E2EE egress proxy (see openshell-server/src/chutes)
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+flate2 = "1"
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
 rand = "0.9"
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 zeroize = { version = "1", features = ["derive"] }

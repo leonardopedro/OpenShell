@@ -15,6 +15,15 @@ CONFIG_VIRTIO_BLK=y
 CONFIG_EXT4_FS=y
 CONFIG_EXT4_USE_FOR_EXT2=y
 
+# 8250 serial console. The guest kernel cmdline always carries console=ttyS0;
+# the libkrun backend ignores it (no UART is emulated), while the
+# cloud-hypervisor backend maps ttyS0 onto its --serial device, which is the
+# only console available for guest diagnostics.
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_CORE=y
+CONFIG_SERIAL_CORE_CONSOLE=y
+
 # Host-directory sharing via virtiofs (used for VM driver bind mounts).
 # The pinned libkrunfw base config already enables both; they are listed here
 # because bind mounts depend on them.

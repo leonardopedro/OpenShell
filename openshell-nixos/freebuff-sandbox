@@ -7,35 +7,60 @@
 #   ./freebuff-sandbox [freebuff args...]
 #   PROJECTS_DIR=~/code SHARE_NIX_RW=1 SANDBOX_NAME=fb2 ./freebuff-sandbox
 #
-# The three mounts (x86_64 allows at most 3 per sandbox):
+# The three mounts (x86_64 allows at most 3 per sandbox, so freebuff's
+# install does NOT get a mount of its own):
 #   /nix          ro   host Nix store  -> guest store (shared libs + nix pkgs;
 #                                   one physical copy on disk AND in RAM:
 #                                   the fork driver gives each share a DAX
 #                                   window, guest mounts dax=always (Route A,
 #                                   measured — see README). ksmd runs anyway
 #                                   (run=1).
-#   /var/lib/fnm  ro   the host's single node install incl. freebuff, opencode,
-#                                   repomix (one copy on disk; same RAM story)
+#   /var/lib/fnm  ro   the host's single node install (node/npx for the
+#                                   agent; one copy on disk; same RAM story)
 #   $PROJECTS_DIR rw   the code you actually want the agent to work on
 #
-# The guest command puts the shared node bin dir on PATH, points the linker at
-# the store's gcc-lib dir, and execs freebuff in $PROJECTS_DIR. Network still
-# goes through OpenShell's policy layer: the first run will ask you to approve
-# freebuff's egress endpoints (its self-updater also downloads the native
-# binary once, into the sandbox's own overlay).
+# Freebuff's native binary and ALL of its state (credentials, settings,
+# history) live in the host's ~/.config/manicode — the npm wrapper's
+# configDir (always $HOME/.config/manicode; its configDir option is
+# test-only and no environment variable overrides it). The guest gets
+# that directory through the workspace mount: before each launch the
+# launcher hardlinks the host dir into
+#   $PROJECTS_DIR/.freebuff-home/.config/manicode
+# and runs the guest with HOME=/workspace/.freebuff-home, so the guest
+# execs exactly the binary the host already has. Nothing is ever
+# downloaded inside the sandbox — a missing host binary aborts the
+# launcher with instructions instead. Hardlinks rather than a symlink
+# because they are plain directory entries inside the mounted subtree:
+# no path outside the share has to resolve through virtiofs, and every
+# pre-existing file keeps ONE inode shared with the host, so state
+# writes land on the host's real files. The farm is rebuilt on every
+# launch — the host dir is the source of truth.
+#
+# The guest command puts the shared node bin dir on PATH, points the
+# linker at the store's gcc-lib dir, cd's into the shared workspace, and
+# execs the native binary with all arguments intact. Network still goes
+# through OpenShell's policy layer: the first run will ask you to
+# approve freebuff's egress endpoints.
 set -euo pipefail
 
 die() { printf 'freebuff-sandbox: %s\n' "$*" >&2; exit 1; }
 
 if [[ "${DRY_RUN:-0}" != 1 ]]; then
-  command -v openshell >/dev/null 2>&1 || die "openshell CLI not on PATH (run: sudo ./install.sh — it lands in /run/current-system/sw/bin)"
+  command -v openshell >/dev/null 2>&1 || die "openshell CLI not on PATH (from the clone root: export PATH=\"\$PWD/scripts/bin:\$PATH\" — see the tutorial — or run ./install.sh for a system install)"
 fi
 command -v node >/dev/null 2>&1 || die "node not on PATH on the host — the guest reuses the host's install, so it must exist here"
-command -v freebuff >/dev/null 2>&1 || die "freebuff not on PATH on the host — npm install -g freebuff first (dedup means: once, here)"
 
 # The real (multishell-shim-free) directory of the host's node toolchain.
 NODE_BIN_DIR="$(dirname "$(readlink -f "$(command -v node)")")"
-[[ -x "$NODE_BIN_DIR/freebuff" ]] || die "freebuff not next to node ($NODE_BIN_DIR) — unexpected install layout"
+
+# Freebuff's configDir — always $HOME/.config/manicode (createLauncher's
+# configDir option is test-only; no environment variable overrides it).
+# The native binary AND all state (credentials, settings, history) live
+# there; the guest runs from a hardlinked farm of this directory (see
+# the header), so the sandbox never downloads anything.
+MANICODE_DIR="$HOME/.config/manicode"
+[[ -x "$MANICODE_DIR/freebuff" ]] ||
+  die "no native freebuff binary at $MANICODE_DIR/freebuff — run 'freebuff' once on the host first (it downloads there over the host's network; sandboxes never download)"
 
 # node is a Nix-built binary (fnm's downloads are the nixpkgs build), so it
 # links libatomic/libstdc++ out of /nix/store. On the host the dynamic linker
@@ -69,6 +94,28 @@ POLICY_FILE="${POLICY_FILE:-$SCRIPT_DIR/sandbox-policy.yaml}"
 
 [[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
 
+# Stage the host's freebuff install+state into the workspace share as a
+# hardlink farm. The guest's HOME points here, so $HOME/.config/manicode
+# inside the guest resolves to this farm through the mount. Rebuilt on
+# every real run (host dir = source of truth); DRY_RUN only prints.
+FB_HOME_HOST="$PROJECTS_DIR/.freebuff-home"
+if [[ -e "$FB_HOME_HOST" && ! -f "$FB_HOME_HOST/.freebuff-sandbox-host" ]]; then
+  die "$FB_HOME_HOST exists but was not created by this launcher — remove it (or move it aside) and retry"
+fi
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  rm -rf "$FB_HOME_HOST"
+  mkdir -p "$FB_HOME_HOST/.config/manicode" ||
+    die "cannot create $FB_HOME_HOST (is PROJECTS_DIR writable?)"
+  if ! cp -al "$MANICODE_DIR/." "$FB_HOME_HOST/.config/manicode/" 2>/dev/null; then
+    # Cross-device link (PROJECTS_DIR on another filesystem): plain copy.
+    rm -rf "$FB_HOME_HOST/.config/manicode"
+    mkdir -p "$FB_HOME_HOST/.config/manicode"
+    cp -a "$MANICODE_DIR/." "$FB_HOME_HOST/.config/manicode/" ||
+      die "cannot stage $MANICODE_DIR into $FB_HOME_HOST"
+  fi
+  : > "$FB_HOME_HOST/.freebuff-sandbox-host"
+fi
+
 NIX_RO=true
 [[ "$SHARE_NIX_RW" == 1 ]] && NIX_RO=false
 
@@ -82,10 +129,14 @@ MOUNTS="[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\
 MOUNTS+="{\"type\":\"bind\",\"source\":\"/var/lib/fnm\",\"target\":\"/var/lib/fnm\",\"read_only\":true},"
 MOUNTS+="{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}]"
 
-# The guest shell: put the shared toolchain on PATH, point the linker at the
-# store's gcc-lib dir, cd to the shared workspace, then hand over to freebuff
-# with all arguments intact.
-GUEST_CMD="export PATH=$NODE_BIN_DIR:\$PATH; export LD_LIBRARY_PATH=$GCC_LIB:\${LD_LIBRARY_PATH:-}; cd /workspace 2>/dev/null || cd /; exec freebuff \"\$@\""
+# The guest shell: put the shared toolchain on PATH, point the linker at
+# the store's gcc-lib dir, point HOME at the staged farm (so the native
+# binary resolves its configDir — binary AND state — through the
+# workspace mount), cd to the shared workspace, then hand over to the
+# native freebuff binary with all arguments intact. The npm wrapper is
+# deliberately NOT run inside the sandbox: its remaining job is
+# downloading/updating the binary, and that must never happen here.
+GUEST_CMD="export PATH=$NODE_BIN_DIR:\$PATH; export LD_LIBRARY_PATH=$GCC_LIB:\${LD_LIBRARY_PATH:-}; export HOME=/workspace/.freebuff-home; cd /workspace 2>/dev/null || cd /; exec /workspace/.freebuff-home/.config/manicode/freebuff \"\$@\""
 
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q \\\n  -- sh -c %q sh %s\n' \

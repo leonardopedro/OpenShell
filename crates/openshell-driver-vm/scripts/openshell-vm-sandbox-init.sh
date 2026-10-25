@@ -31,6 +31,15 @@ mount_initial_fs() {
     mount -t tmpfs tmpfs /tmp 2>/dev/null || true
     mount -t tmpfs tmpfs /run 2>/dev/null || true
     mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    # devtmpfs carries device nodes but not the proc-backed convenience
+    # links (/dev/fd, /dev/stdin, ...), and an image that bakes them loses
+    # them under the devtmpfs mount. bash re-opens its own script through
+    # /dev/fd/N while running PID 1, so missing links abort the boot with
+    # "line N: /dev/fd/N: No such file or directory". Recreate them.
+    ln -sfn /proc/self/fd /dev/fd
+    ln -sfn /proc/self/fd/0 /dev/stdin
+    ln -sfn /proc/self/fd/1 /dev/stdout
+    ln -sfn /proc/self/fd/2 /dev/stderr
 }
 
 bind_mount_into_newroot() {

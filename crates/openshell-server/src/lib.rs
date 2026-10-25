@@ -15,6 +15,7 @@
 
 mod auth;
 pub mod certgen;
+pub mod chutes;
 pub mod cli;
 mod compute;
 mod config_delivery;

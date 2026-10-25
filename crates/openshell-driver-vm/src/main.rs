@@ -253,6 +253,11 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_GUEST_NIX_CACHE", default_value_t = false)]
     guest_nix_cache: bool,
 
+    /// Default VM backend for sandboxes without a `driver_config.vm.backend`
+    /// selection: `libkrun`, `qemu`, or `cloud-hypervisor`.
+    #[arg(long, env = "OPENSHELL_VM_DEFAULT_BACKEND")]
+    default_vm_backend: Option<VmBackend>,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -374,6 +379,7 @@ async fn main() -> Result<()> {
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
         enable_bind_mounts: args.enable_bind_mounts,
         guest_nix_cache: args.guest_nix_cache,
+        default_vm_backend: args.default_vm_backend,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -659,6 +665,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
 
     let backend = match args.vm_backend.as_deref() {
         Some("qemu") => VmBackend::Qemu,
+        Some("cloud-hypervisor") => VmBackend::CloudHypervisor,
         Some("libkrun") | None => VmBackend::Libkrun,
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };

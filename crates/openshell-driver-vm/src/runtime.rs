@@ -19,10 +19,27 @@ const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum VmBackend {
     Libkrun,
     Qemu,
+    CloudHypervisor,
+}
+
+impl std::str::FromStr for VmBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "libkrun" => Ok(Self::Libkrun),
+            "qemu" => Ok(Self::Qemu),
+            "cloud-hypervisor" => Ok(Self::CloudHypervisor),
+            other => Err(format!(
+                "unknown VM backend '{other}': expected libkrun, qemu, or cloud-hypervisor"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +84,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     match config.backend {
         VmBackend::Qemu => run_qemu_vm(config),
         VmBackend::Libkrun => run_libkrun_vm(config),
+        VmBackend::CloudHypervisor => run_cloud_hypervisor_vm(config),
     }
 }
 
@@ -185,6 +203,312 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("QEMU exited with status {status}"))
+    }
+}
+
+/// Guest kernel candidates probed for the Cloud-Hypervisor backend when
+/// `OPENSHELL_VM_CH_KERNEL` is unset: the locally built Cloud-Hypervisor
+/// workspace (dev machines where this repo sits next to `cloud-hypervisor-build/`)
+/// first, then the working directory (a kernel dropped next to the driver).
+const CH_KERNEL_CANDIDATES: [&str; 6] = [
+    "../cloud-hypervisor-build/workloads/vmlinux-x86_64",
+    "../cloud-hypervisor-build/workloads/bzImage-x86_64",
+    "../../cloud-hypervisor-build/workloads/vmlinux-x86_64",
+    "../../cloud-hypervisor-build/workloads/bzImage-x86_64",
+    "ch-vmlinux-x86_64",
+    "ch-bzImage-x86_64",
+];
+
+fn cloud_hypervisor_tool_env(key: &str, default: &str) -> PathBuf {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(default),
+    }
+}
+
+/// Host-side unix socket cloud-hypervisor's vsock muxer binds (its
+/// host-initiated listener). The muxer has no host AF_VSOCK path: for a
+/// guest-initiated dial to `port` it connects to `"<socket>_<port>"` — see
+/// [`cloud_hypervisor_supervisor_socket`], which the driver hands to the
+/// supervisor as its runtime-initiated listener.
+pub fn cloud_hypervisor_vsock_socket(state_dir: &Path) -> PathBuf {
+    state_dir.join("vsock.sock")
+}
+
+/// The exact path cloud-hypervisor connects to when the guest dials `port`:
+/// the muxer appends `_<port>` to its vsock socket path.
+pub fn cloud_hypervisor_supervisor_socket(state_dir: &Path, port: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "{}_{}",
+        cloud_hypervisor_vsock_socket(state_dir).display(),
+        port
+    ))
+}
+
+/// Resolve the guest kernel image for the Cloud-Hypervisor backend.
+/// Precedence: `OPENSHELL_VM_CH_KERNEL`, an explicit `--kernel` in the launch
+/// config, dev-machine fallbacks, then a clear setup hint. CH detects the
+/// image format itself (bzImage or ELF vmlinux).
+fn resolve_cloud_hypervisor_kernel(config: &VmLaunchConfig) -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("OPENSHELL_VM_CH_KERNEL") {
+        if !explicit.is_empty() {
+            let path = PathBuf::from(&explicit);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(format!("OPENSHELL_VM_CH_KERNEL={explicit} is not a file"));
+        }
+    }
+    if let Some(kernel_image) = &config.kernel_image {
+        if kernel_image.is_file() {
+            return Ok(kernel_image.clone());
+        }
+    }
+    let cwd = std::env::current_dir().map_err(|err| format!("current_dir: {err}"))?;
+    for candidate in CH_KERNEL_CANDIDATES {
+        let path = cwd.join(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err(
+        "Cloud-Hypervisor guest kernel not found: set OPENSHELL_VM_CH_KERNEL to a bzImage or \
+         ELF vmlinux, e.g. download https://github.com/cloud-hypervisor/linux/releases/download/\
+         ch-release-v6.16.9-20251112/vmlinux-x86_64"
+            .to_string(),
+    )
+}
+
+/// Disk arguments in guest device order: root (read-only), overlay
+/// (read-write), optional image (read-only) — matching `qemu_disk_args` and
+/// the libkrun disk ids so `/dev/vda` + `root=/dev/vda` stay valid.
+fn cloud_hypervisor_disk_args(config: &VmLaunchConfig) -> Vec<String> {
+    let mut args = vec![
+        format!("path={},readonly=on", config.root_disk.display()),
+        format!("path={}", config.overlay_disk.display()),
+    ];
+    if let Some(image_disk) = &config.image_disk {
+        args.push(format!("path={},readonly=on", image_disk.display()));
+    }
+    args
+}
+
+/// Cloud-Hypervisor worker: same guest contract as the QEMU path (env file
+/// injected into the overlay, identical kernel cmdline, vsock CID, serial-to-
+/// file console) plus virtiofsd-backed `--fs` shares whose `osfsN` tags match
+/// the driver-injected guest mount manifest, and optional VFIO GPU passthrough.
+fn run_cloud_hypervisor_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    if !config.root_disk.is_file() {
+        return Err(format!(
+            "root disk image not found: {}",
+            config.root_disk.display()
+        ));
+    }
+    if !config.overlay_disk.is_file() {
+        return Err(format!(
+            "overlay disk image not found: {}",
+            config.overlay_disk.display()
+        ));
+    }
+    if let Some(image_disk) = &config.image_disk
+        && !image_disk.is_file()
+    {
+        return Err(format!("image disk not found: {}", image_disk.display()));
+    }
+    let vsock_cid = config
+        .vsock_cid
+        .ok_or("vsock_cid is required for CloudHypervisor backend")?;
+    if config.dax_window_mib.is_some() {
+        return Err(
+            "DAX windows are not yet supported with the Cloud-Hypervisor backend".to_string(),
+        );
+    }
+
+    if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
+        return Err(format!("procguard arm failed: {err}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    check_kvm_access()?;
+
+    let guest_env = qemu_guest_env_vars(config);
+    write_guest_env_file(&config.overlay_disk, &guest_env)?;
+
+    let kernel_image = resolve_cloud_hypervisor_kernel(config)?;
+    let kernel_cmdline = build_kernel_cmdline(config);
+    raise_nofile_limit();
+
+    // All per-VM state (API socket, virtiofsd sockets) shares the console
+    // output's directory so lifecycle cleanup removes it with the state dir.
+    let state_dir = config
+        .console_output
+        .parent()
+        .ok_or_else(|| "console output path has no parent directory".to_string())?;
+    let api_socket = state_dir.join("cloud-hypervisor.sock");
+    let _ = std::fs::remove_file(&api_socket);
+    // `--vsock socket=` names the muxer's base socket; the supervisor binds
+    // the suffixed sibling derived from it (driver side builds the same pair
+    // via `cloud_hypervisor_supervisor_socket`). The libkrun port-map socket
+    // carries the identical path when the driver provided one.
+    let vsock_socket = config
+        .vsock_port_map
+        .as_ref()
+        .map(|map| map.host_socket.clone())
+        .unwrap_or_else(|| cloud_hypervisor_vsock_socket(state_dir));
+
+    // One virtiofsd per share, tagged with the driver-generated `osfsN` tag
+    // the guest mount manifest also uses. Each daemon dies with this launcher
+    // (PR_SET_PDEATHSIG) so no helper can outlive the sandbox.
+    let virtiofsd_path = cloud_hypervisor_tool_env("OPENSHELL_VM_CH_VIRTIOFSD", "virtiofsd");
+    let mut fs_socks = Vec::with_capacity(config.mounts.len());
+    let mut fs_daemons: Vec<std::process::Child> = Vec::with_capacity(config.mounts.len());
+    for mount in &config.mounts {
+        let socket = state_dir.join(format!("virtiofsd-{}.sock", fs_daemons.len()));
+        let _ = std::fs::remove_file(&socket);
+        let mut cmd = StdCommand::new(&virtiofsd_path);
+        cmd.arg("--socket-path")
+            .arg(&socket)
+            .arg("--shared-dir")
+            .arg(&mount.host_path);
+        if mount.read_only {
+            cmd.arg("--readonly");
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::Signal;
+            use std::os::unix::process::CommandExt as _;
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                        .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
+                });
+            }
+        }
+        let daemon = cmd.spawn().map_err(|err| {
+            format!(
+                "failed to start virtiofsd ({}): {err}",
+                virtiofsd_path.display()
+            )
+        })?;
+        fs_daemons.push(daemon);
+        fs_socks.push((mount.tag.clone(), socket));
+    }
+
+    let cloud_hypervisor_path = cloud_hypervisor_tool_env(
+        "OPENSHELL_VM_CH_PATH",
+        "cloud-hypervisor",
+    );
+    let mut ch_cmd = StdCommand::new(&cloud_hypervisor_path);
+    ch_cmd
+        .arg("--api-socket")
+        .arg(&api_socket)
+        .arg("--kernel")
+        .arg(&kernel_image)
+        .arg("--cmdline")
+        .arg(&kernel_cmdline)
+        .arg("--cpus")
+        .arg(format!("boot={}", config.vcpus))
+        // cloud-hypervisor rejects every vhost-user device — both virtiofs
+        // `--fs` shares and the spectrum vhost-user GPU — unless guest memory
+        // is shared-memory backed (`VhostUserRequiresSharedMemory`).
+        .arg("--memory")
+        .arg(format!("size={}M,shared=on", config.mem_mib));
+    // cloud-hypervisor's clap surface declares `--disk` and `--fs` as
+    // `num_args(1..)`: a single occurrence carrying every value, not one
+    // occurrence per device (repeating the flag is a clap usage error).
+    let disk_values = cloud_hypervisor_disk_args(config);
+    if !disk_values.is_empty() {
+        ch_cmd.arg("--disk").args(disk_values);
+    }
+    if !fs_socks.is_empty() {
+        ch_cmd.arg("--fs").args(
+            fs_socks
+                .iter()
+                .map(|(tag, socket)| {
+                    // One data queue: FsConfig::validate caps num_queues at
+                    // the boot vCPU count, device creation adds its special
+                    // queue on top, and virtiofsd advertises a max of 2 — so
+                    // anything above 1 fails vhost-user negotiation.
+                    format!(
+                        "tag={tag},socket={},num_queues=1,queue_size=1024",
+                        socket.display()
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(gpu_bdf) = &config.gpu_bdf {
+        ch_cmd.arg("--device").arg(format!("path={gpu_bdf}"));
+    }
+    // Spectrum's vhost-user GPU (crosvm `device gpu` backend): pass its
+    // socket when the host side has one listening. Mutually independent from
+    // the VFIO BDF above — CH accepts both device models. A vanished socket
+    // degrades to a GPU-less boot (the spectrum launch script does the same)
+    // so a crashed crosvm cannot brick every sandbox launch.
+    if let Ok(gpu_socket) = std::env::var("OPENSHELL_VM_CH_GPU_SOCKET") {
+        if !gpu_socket.is_empty() {
+            if Path::new(&gpu_socket).exists() {
+                ch_cmd.arg("--gpu").arg(format!("socket={gpu_socket}"));
+            } else {
+                eprintln!(
+                    "cloud-hypervisor: OPENSHELL_VM_CH_GPU_SOCKET={gpu_socket} is absent, \
+                     launching without vhost-user GPU"
+                );
+            }
+        }
+    }
+    ch_cmd
+        .arg("--vsock")
+        .arg(format!(
+            "cid={vsock_cid},socket={}",
+            vsock_socket.display()
+        ))
+        .arg("--console")
+        .arg("off")
+        .arg("--serial")
+        .arg(format!("file={}", config.console_output.display()));
+    ch_cmd.stdin(Stdio::null());
+    ch_cmd.stdout(Stdio::inherit());
+    ch_cmd.stderr(Stdio::inherit());
+
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::signal::Signal;
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            ch_cmd.pre_exec(|| {
+                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                    .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
+            });
+        }
+    }
+
+    let mut ch_child = ch_cmd.spawn().map_err(|err| {
+        format!(
+            "failed to start cloud-hypervisor ({}): {err}",
+            cloud_hypervisor_path.display()
+        )
+    })?;
+
+    let ch_pid = ch_child.id().cast_signed();
+    install_signal_forwarding(ch_pid);
+
+    let status = ch_child
+        .wait()
+        .map_err(|err| format!("failed to wait for cloud-hypervisor: {err}"))?;
+
+    CHILD_PID.store(0, Ordering::Relaxed);
+    for mut daemon in fs_daemons {
+        let _ = daemon.kill();
+    }
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cloud-hypervisor exited with status {status}"))
     }
 }
 
@@ -929,6 +1253,56 @@ mod tests {
                 .any(|arg| arg.contains("id=overlay,readonly=on"))
         );
         assert!(args.contains(&"virtio-blk-pci,drive=overlay".to_string()));
+    }
+
+    #[test]
+    fn cloud_hypervisor_disk_args_attach_base_readonly_and_overlay_readwrite() {
+        let args = cloud_hypervisor_disk_args(&qemu_config());
+
+        assert_eq!(args[0], "path=/rootfs.ext4,readonly=on");
+        assert_eq!(args[1], "path=/overlay.ext4");
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn cloud_hypervisor_disk_args_attach_prepared_image_readonly_when_present() {
+        let mut config = qemu_config();
+        config.image_disk = Some(PathBuf::from("/image-rootfs.ext4"));
+
+        let args = cloud_hypervisor_disk_args(&config);
+
+        assert_eq!(args[2], "path=/image-rootfs.ext4,readonly=on");
+    }
+
+    #[test]
+    fn cloud_hypervisor_kernel_resolution_honours_env_override() {
+        let mut config = qemu_config();
+        config.backend = VmBackend::CloudHypervisor;
+        let probe = std::env::temp_dir().join("openshell-ch-kernel-probe");
+        std::fs::write(&probe, b"k").expect("write kernel probe");
+        // SAFETY: single-threaded test touching a variable no other test reads.
+        unsafe {
+            std::env::set_var("OPENSHELL_VM_CH_KERNEL", &probe);
+        }
+        let resolved = resolve_cloud_hypervisor_kernel(&config);
+        unsafe {
+            std::env::remove_var("OPENSHELL_VM_CH_KERNEL");
+        }
+        let _ = std::fs::remove_file(&probe);
+
+        assert_eq!(resolved.unwrap(), probe);
+    }
+
+    #[test]
+    fn vm_backend_parses_cli_and_config_names() {
+        assert_eq!(
+            "cloud-hypervisor".parse::<VmBackend>().unwrap(),
+            VmBackend::CloudHypervisor
+        );
+        assert_eq!("libkrun".parse::<VmBackend>().unwrap(), VmBackend::Libkrun);
+        assert_eq!("qemu".parse::<VmBackend>().unwrap(), VmBackend::Qemu);
+        let err = "kvm".parse::<VmBackend>().unwrap_err();
+        assert!(err.contains("cloud-hypervisor"));
     }
 
     #[test]
