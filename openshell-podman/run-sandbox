@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# run-sandbox — run a command in an OpenShell sandbox on this (rootless
+# Podman) machine, with the host's /nix shared in — the podman counterpart of
+# ../openshell-nixos/freebuff-sandbox.
+#
+#   ./run-sandbox                      # parked sandbox (sleep), then exec in
+#   ./run-sandbox -- node --version    # run a command in the sandbox
+#   PROJECTS_DIR=~/code SANDBOX_NAME=fb2 ./run-sandbox -- freebuff ...
+#
+# The mounts (Podman has no 3-per-sandbox cap — that limit was x86_64
+# microVM; binds here are plain host directory binds):
+#   /nix          ro   host Nix store: one physical copy on disk AND in RAM
+#                  (a container shares the host page cache by construction —
+#                  this is what virtiofs+DAX had to be engineered to equal)
+#   /var/lib/fnm  ro   the host's node install, when the host has it
+#   /etc/nix      ro   the rendered nix.conf (nixcache: substituters + keys)
+#   $PROJECTS_DIR rw   the code you actually want the agent to work on
+#
+# PRIVATE_STORE (default ON since 2026-10-26; PRIVATE_STORE=0 opts out and
+# restores exactly the shared read-only shape above) swaps
+# store that still dedups with the host cache: /nix/store and /nix/var become
+# fresh host dirs bind-mounted over the ro tree, pre-seeded with a mirror of
+# the host store (directories symlinked into a read-only /opt/host-store —
+# zero bytes; top-level files copied, they are small) plus the host db dump —
+# so nix inside treats every host path as already installed: realizing one
+# costs zero downloads and zero new content. Paths the host lacks are
+# fetched/built into the private store as real files and can be pushed back
+# with nixcache-push (ingest.sh imports them into the host store, where
+# nix-serve serves them to everyone). See private-store-seed.sh.
+#
+# File access inside the workload is gated by Landlock rules derived from
+# sandbox-policy.yaml (next to this launcher) — without it every open() on
+# the shared mounts returns EACCES even though the mounts are live.
+set -euo pipefail
+
+die() { printf 'run-sandbox: %s\n' "$*" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  command -v openshell >/dev/null 2>&1 ||
+    die "openshell CLI not on PATH (from the clone root: export PATH=\"\$PWD/scripts/bin:\$PATH\" — the script builds openshell-cli if needed)"
+fi
+
+# The rendered policy. The repo copy is machine-independent — it reaches the
+# cache through host.openshell.internal (OpenShell's alias for the gateway
+# host), so unlike the old LAN-address form there is nothing to substitute.
+POLICY_FILE="${POLICY_FILE:-$HOME/.config/openshell/sandbox-policy.yaml}"
+[[ -f "$POLICY_FILE" ]] ||
+  die "policy file not found: $POLICY_FILE — render it from $SCRIPT_DIR/sandbox-policy.yaml (see README.md)"
+
+# The rendered nix.conf directory (bind source). The repo template is
+# ../openshell-podman/nix.conf; render it per nix.conf's header before the
+# first run.
+NIX_CONF_DIR="${NIX_CONF_DIR:-$HOME/.config/openshell/nix-conf}"
+[[ -f "$NIX_CONF_DIR/nix.conf" ]] ||
+  die "no rendered nix.conf at $NIX_CONF_DIR/nix.conf — render the template first (see nix.conf header or README.md)"
+
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
+SANDBOX_NAME="${SANDBOX_NAME:-nixshare}"
+SHARE_NIX_RW="${SHARE_NIX_RW:-0}"
+# Private dedup store is the default (README § Migration); =0 → shared ro.
+PRIVATE_STORE="${PRIVATE_STORE:-1}"
+
+[[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
+
+# JSON built with plain string interpolation — every input is an absolute
+# host path; refuse quotes/backslashes rather than escape them.
+for p in "$PROJECTS_DIR" "$NIX_CONF_DIR" "$SCRIPT_DIR"; do
+  [[ "$p" != *\"* && "$p" != *\\* ]] || die "path contains a quote/backslash, refusing to build mount JSON: $p"
+done
+
+NIX_RO=true
+[[ "$SHARE_NIX_RW" == 1 ]] && NIX_RO=false
+
+MOUNTS="[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":$NIX_RO},"
+MOUNTS+="{\"type\":\"bind\",\"source\":\"$NIX_CONF_DIR\",\"target\":\"/etc/nix\",\"read_only\":true},"
+MOUNTS+="{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}"
+# /var/lib/fnm only where it exists — it carries freebuff's node on the VM
+# host, and not every machine has fnm.
+if [[ -d /var/lib/fnm ]]; then
+  MOUNTS+=",{\"type\":\"bind\",\"source\":\"/var/lib/fnm\",\"target\":\"/var/lib/fnm\",\"read_only\":true}"
+fi
+
+# --- PRIVATE_STORE=1: stage the private store + seed material --------------
+# Fresh dirs per run — see the header: container-owned files inside a reused
+# dir cannot be rm'd by this user, and a silently failed wipe once poisoned
+# the db (validity rows without files -> every build then died with ENOENT).
+# Orphans are cleaned with `podman unshare rm -rf /tmp/openshell-store.*`
+# AFTER the owning sandbox is deleted.
+if [[ "$PRIVATE_STORE" == 1 ]]; then
+  STAGE="$(mktemp -d "${TMPDIR:-/tmp}/openshell-store.XXXXXX")"
+  PSROOT="$STAGE/store"
+  PSVAR="$STAGE/var"
+  SEED="$STAGE/seed"
+  mkdir -p "$PSROOT" "$PSVAR" "$SEED"
+  # SELinux: the container may only open container_file_t sources (see the
+  # preflight below — same reason, applied per staged dir).
+  chcon -t container_file_t "$STAGE" "$PSROOT" "$PSVAR" "$SEED" 2>/dev/null || true
+  # 0777: the workload runs as the image uid; through the rootless uid map
+  # these dirs would otherwise look root-owned 755 inside -> EACCES.
+  chmod 0777 "$PSROOT" "$PSVAR"
+  chmod 0755 "$SEED"
+
+  # 1. Mirror the host store into the private dir: DIRECTORIES are symlinked
+  #    (the bulk of the store — zero bytes, served from /opt/host-store),
+  #    top-level REGULAR files (drvs + file outputs; measured 25MB + 2.2MB)
+  #    are copied, because both shapes were measured to matter:
+  #      * nix-store --load-db opens top-level files O_NOFOLLOW — a symlink
+  #        there fails with ELOOP ("Too many levels of symbolic links");
+  #      * load-db refuses rows whose file is missing outright, so the dump
+  #        needs every regular file present. Directory entries were
+  #        measured fine as symlinks (load-db lstats them, never opens them).
+  #    Links/copies first, dump second: a concurrent host GC can then only
+  #    leave an extra unregistered dangling link (benign) — never a db row
+  #    whose file is missing (poison).
+  for p in /nix/store/*; do
+    b="${p##*/}"
+    if [[ -d "$p" ]]; then
+      ln -sfn "/opt/host-store/$b" "$PSROOT/$b"
+    else
+      cp -p "$p" "$PSROOT/$b"
+    fi
+  done
+
+  # 2. Dump with the very nix-store the sandbox will load it with, so dump
+  #    and load formats always match (hand the path to seed.sh via a file).
+  NIX_STORE_BIN="$(command -v nix-store || echo "$(ls /nix/store/*-nix-[0-9]*/bin/nix-store 2>/dev/null | head -1)")"
+  [[ -n "$NIX_STORE_BIN" && -x "$NIX_STORE_BIN" ]] ||
+    die "PRIVATE_STORE: no nix-store binary to dump the host db with"
+  "$NIX_STORE_BIN" --dump-db > "$SEED/db.dump"
+  printf '%s\n' "$NIX_STORE_BIN" > "$SEED/nix-store-path"
+  install -m 755 "$SCRIPT_DIR/private-store-seed.sh" "$SEED/seed.sh"
+  chcon -t container_file_t "$SEED"/* 2>/dev/null || true
+
+  # Overlays AFTER the ro /nix base (podman applies mounts in list order),
+  # plus the read-only mirror and the seed material under /opt — the policy
+  # already has /opt, /nix/store and /nix/var in its allowlist.
+  MOUNTS+=",{\"type\":\"bind\",\"source\":\"$PSROOT\",\"target\":\"/nix/store\",\"read_only\":false},"
+  MOUNTS+="{\"type\":\"bind\",\"source\":\"$PSVAR\",\"target\":\"/nix/var\",\"read_only\":false},"
+  MOUNTS+="{\"type\":\"bind\",\"source\":\"/nix/store\",\"target\":\"/opt/host-store\",\"read_only\":true},"
+  MOUNTS+="{\"type\":\"bind\",\"source\":\"$SEED\",\"target\":\"/opt/seed\",\"read_only\":true}"
+fi
+MOUNTS+="]"
+
+# --- SELinux preflight --------------------------------------------------
+# Landlock is only the second gate on an Enforcing host (this machine: Oracle
+# Linux 10, SELinux Enforcing): container_t may open a bind source only if
+# its label is container_file_t. Without that label the mounts attach, the
+# policy validates, Landlock passes — and every read inside the sandbox
+# still fails with a bare "Permission denied", which is exactly how this
+# was discovered. Podman's own `:z` relabel option is NOT the fix here:
+# /nix/store is root-owned, and one `lsetxattr` EPERM aborts container
+# creation outright. One-time relabel per source instead:
+#   sudo chcon -R -t container_file_t /nix   # root-owned store
+#   chcon -R -t container_file_t <source>    # user-owned sources
+# New files inherit the directory's label, so the relabel sticks.
+if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == Enforcing ]]; then
+  SELINUX_BAD=()
+  for src in /nix "$NIX_CONF_DIR" "$PROJECTS_DIR" /var/lib/fnm; do
+    [[ -d "$src" ]] || continue
+    ls -Zd "$src" 2>/dev/null | grep -q container_file_t || SELINUX_BAD+=("$src")
+  done
+  if [[ "${#SELINUX_BAD[@]}" -gt 0 ]]; then
+    die "SELinux (Enforcing): these bind sources are not container_file_t — the sandbox would fail every read on them with Permission denied:
+  ${SELINUX_BAD[*]}
+Fix once (root-owned paths need sudo, the rest do not):
+  sudo chcon -R -t container_file_t /nix
+  chcon -R -t container_file_t <each user-owned path above>"
+  fi
+fi
+
+# A leading `--` is the documented option/command separator (`./run-sandbox --
+# cmd ...`); consume it, or the supervisor tries to exec a file named `--`
+# ("failed to spawn sandbox entrypoint process '--'").
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+if [[ "$#" -gt 0 ]]; then
+  CMD=("$@")
+else
+  # Parked by default: keep the sandbox alive so `openshell sandbox exec`
+  # (or the TUI) can drive it, the way a gateway-created sandbox is used.
+  CMD=(sleep 3600)
+fi
+
+# PRIVATE_STORE: load the host db dump before the workload starts (the
+# symlinks are already in place from staging); `exec` keeps the workload
+# PID-direct so signals and exit codes behave as unwrapped.
+if [[ "$PRIVATE_STORE" == 1 ]]; then
+  CMD=(sh -c '/opt/seed/seed.sh && exec "$@"' seed-guard "${CMD[@]}")
+fi
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  # %q per element: with PRIVATE_STORE the command is a wrapper (sh -c …)
+  # whose quoting must survive copy-paste.
+  CMD_Q="$(printf ' %q' "${CMD[@]}")"
+  printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q \\\n  --%s\n' \
+    "$SANDBOX_NAME" "{\"podman\":{\"mounts\":$MOUNTS}}" "$POLICY_FILE" "$CMD_Q"
+  exit 0
+fi
+
+exec openshell sandbox create --name "$SANDBOX_NAME" \
+  --driver-config-json "{\"podman\":{\"mounts\":$MOUNTS}}" \
+  --policy "$POLICY_FILE" \
+  -- "${CMD[@]}"

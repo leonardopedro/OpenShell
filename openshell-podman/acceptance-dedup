@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# acceptance-dedup — the T-A/T-B acceptance pair for the dedup loop as ONE
+# rerunnable check (design doc §7 podman run; baseline measured 2026-10-26).
+#
+#   T-A (consumer):  a PRIVATE_STORE sandbox treats the host store as its
+#                    own — validity for all three path shapes (drv / dir
+#                    output / file output), a mirror footprint far below the
+#                    host store, and an *offline* realise
+#                    (--option substituters '') that adds ZERO store entries
+#                    and ZERO files.
+#   T-B (producer):  the guest creates a brand-new path, pushes it with
+#                    nixcache-push, the inbox unit auto-ingests it (host
+#                    store + gcroot + nix-serve narinfo WITH host signature
+#                    + archived signed receipt), and a FRESH sandbox then
+#                    finds the path valid at seed time with no download
+#                    cache at all.
+#
+# Self-cleaning: pre-runs scrub its own leftovers from crashed runs, and it
+# cleans up afterwards (sandboxes, uid-mapped stage dirs, the test store
+# path + gcroot + receipt, workspace files). Exits non-zero on any FAIL;
+# WARNs (e.g. path unit not active → manual ingest) do not fail the run.
+#
+# Usage:  ./acceptance-dedup
+# Time:   a few minutes; each sandbox create is polled for up to ~12 min
+#         (the gateway occasionally blocks for minutes on create — observed,
+#         not a failure of this check).
+set -u
+export PATH="$HOME/.local/bin:$PATH"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+A=dedup-accept-a
+B=dedup-accept-b
+WS="${PROJECTS_DIR:-$HOME/Projects}"
+GCROOTS="$HOME/.local/share/openshell-gcroots"
+RECEIPTS="$GCROOTS/receipts"
+LOGDIR="$(mktemp -d /tmp/acceptance-dedup.XXXXXX)"
+PAYLOAD="dedup-accept payload v1"
+
+PASS=0; FAIL=0; WARN=0
+ok()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
+bad() { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); }
+wrn() { echo "  WARN  $*"; WARN=$((WARN + 1)); }
+sec() { echo; echo "=== $* ==="; }
+
+wait_gone() {  # name [tries]
+  local n="$1" i tries="${2:-60}"
+  for i in $(seq 1 "$tries"); do
+    openshell sandbox get "$n" >/dev/null 2>&1 || return 0
+    sleep 5
+  done
+  return 1
+}
+
+wait_ready() {  # name [tries]
+  local n="$1" i ph tries="${2:-150}"
+  for i in $(seq 1 "$tries"); do
+    ph=$(openshell sandbox get "$n" 2>/dev/null | awk '/Phase:/{print $2; exit}')
+    [ "$ph" = "Ready" ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+# Phase Ready PRECEDES seed completion (measured 2026-10-26: Ready at +17s,
+# seed: done at +23s — load-db checks every derivation). Probing validity
+# in that window reads a partially-loaded db and returns arbitrary "not
+# valid" results; every in-guest assertion must wait for the seed line.
+wait_seed() {  # create-log [tries]
+  local log="$1" i tries="${2:-90}"
+  for i in $(seq 1 "$tries"); do
+    grep -qE 'seed: (done|host db already present)' "$log" 2>/dev/null && return 0
+    sleep 2
+  done
+  return 1
+}
+
+delete_sandbox() {
+  local n="$1"
+  openshell sandbox get "$n" >/dev/null 2>&1 || return 0
+  openshell sandbox delete "$n" >/dev/null 2>&1 || true
+  wait_gone "$n" 60 || wrn "sandbox $n did not disappear within 5min"
+}
+
+# The test path has fixed content -> fixed store name; scrub by glob so a
+# crashed earlier run cannot poison this one (the stale-validity trap).
+clean_test_paths() {
+  local p h
+  shopt -s nullglob
+  for p in /nix/store/*-dedup-accept.txt*; do
+    h="$(basename "$p")"; h="${h%%-*}"
+    rm -f "$GCROOTS/$(basename "$p")" "$RECEIPTS/$h.narinfo" 2>/dev/null
+    nix --extra-experimental-features nix-command store delete "$p" >/dev/null 2>&1 || true
+  done
+  shopt -u nullglob
+  rm -f "$WS/dedup-accept.txt" "$WS/.accept-path"
+}
+
+count_asserts() {  # prefix, text  — parse @@OK/@@FAIL lines from in-sandbox runs
+  local prefix="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      "@@OK "*)   ok "$prefix ${line#@@OK }" ;;
+      "@@FAIL "*) bad "$prefix ${line#@@FAIL }" ;;
+      *)          [ -n "$line" ] && echo "        $line" ;;
+    esac
+  done <<< "$2"
+}
+
+NS_HOST="$(command -v nix-store || ls /nix/store/*-nix-[0-9]*/bin/nix-store 2>/dev/null | head -1)"
+
+# ---------------------------------------------------------------- pre-clean
+sec "pre-clean (previous runs, uid-mapped stages)"
+for n in "$A" "$B"; do
+  if openshell sandbox get "$n" >/dev/null 2>&1; then
+    echo "deleting stale sandbox $n"
+    delete_sandbox "$n"
+  fi
+done
+clean_test_paths
+podman unshare rm -rf /tmp/openshell-store.* 2>/dev/null || true
+echo "stages left: $(ls -d /tmp/openshell-store.* 2>/dev/null | wc -l)"
+
+# ----------------------------------------------------------------- sandbox A
+sec "T-A setup: create sandbox A (PRIVATE_STORE=1)"
+(cd "$SCRIPT_DIR" && PRIVATE_STORE=1 SANDBOX_NAME="$A" ./run-sandbox) \
+  > "$LOGDIR/create-a.log" 2>&1 &
+if wait_ready "$A"; then
+  ok "sandbox A Ready"
+else
+  bad "sandbox A never became Ready (log: $LOGDIR/create-a.log)"
+  tail -5 "$LOGDIR/create-a.log" 2>/dev/null
+  sec "summary (aborted)"; echo "PASS=$PASS FAIL=$FAIL WARN=$WARN"
+  exit 1
+fi
+if wait_seed "$LOGDIR/create-a.log"; then
+  ok "sandbox A seed complete"
+else
+  bad "sandbox A seed did not complete (log: $LOGDIR/create-a.log)"
+fi
+
+sec "T-A assertions (mirror shape, validity, offline realise)"
+TOUT=$(openshell sandbox exec "$A" -- bash -s <<'IN' 2>&1
+set +e
+NS=$(cat /opt/seed/nix-store-path)
+a() { if [ "$2" = ok ]; then echo "@@OK $1"; else echo "@@FAIL $1 ($2)"; fi; }
+
+ENTRIES=$(ls /nix/store | wc -l)
+RFILES=$(find /nix/store -maxdepth 1 -mindepth 1 -type f | wc -l)
+RLINKS=$(find /nix/store -maxdepth 1 -mindepth 1 -type l | wc -l)
+RDIRS=$(find /nix/store -maxdepth 1 -mindepth 1 -type d | wc -l)
+SIZE_M=$(du -sm /nix/store | cut -f1)
+echo "mirror: entries=$ENTRIES files=$RFILES symlinks=$RLINKS realdirs=$RDIRS size=${SIZE_M}MB"
+
+[ "$ENTRIES" -ge 4000 ] 2>/dev/null && a "seeded-entries" ok || a "seeded-entries" "only $ENTRIES"
+[ "$RLINKS" -ge 400 ]   2>/dev/null && a "dirs-symlinked" ok  || a "dirs-symlinked" "$RLINKS links"
+[ "$RDIRS" -le 2 ]      2>/dev/null && a "no-dir-content-copied" ok || a "no-dir-content-copied" "$RDIRS real dirs"
+[ "$SIZE_M" -lt 500 ]   2>/dev/null && a "mirror-under-500MB" ok || a "mirror-under-500MB" "${SIZE_M}MB"
+
+# validity of all three shapes: a drv, a file output, a dir output
+DRV=$(ls /nix/store/*.drv 2>/dev/null | head -1)
+FILEOUT=$(find /nix/store -maxdepth 1 -type f ! -name '*.drv' | head -1)
+[ -n "$DRV" ] && "$NS" --check-validity "$DRV" 2>/dev/null \
+  && a "valid-drv" ok || a "valid-drv" "missing or invalid"
+[ -n "$FILEOUT" ] && "$NS" --check-validity "$FILEOUT" 2>/dev/null \
+  && a "valid-file-output" ok || a "valid-file-output" "missing or invalid"
+
+# find a drv whose output exists and is valid (first 50, then first 300)
+DER=""; OUT=""
+for set in "$(ls /nix/store/*.drv | head -50)" "$(ls /nix/store/*.drv | head -300)"; do
+  for d in $set; do
+    o=$("$NS" -q --outputs "$d" 2>/dev/null | head -1)
+    if [ -n "$o" ] && [ -e "$o" ] && "$NS" --check-validity "$o" 2>/dev/null; then
+      DER=$d; OUT=$o; break
+    fi
+  done
+  [ -n "$DER" ] && break
+done
+if [ -n "$OUT" ]; then
+  a "valid-dir-output" ok; echo "realise pair: $DER -> $OUT"
+else
+  a "valid-dir-output" "no realiseable drv found"
+fi
+
+# closure query over seeded refs
+NIXDIR=$(ls -d /nix/store/*-nix-[0-9]* 2>/dev/null | grep -v '\.drv$' | head -1)
+REFS=$("$NS" -qR "$NIXDIR" 2>/dev/null | wc -l)
+[ "$REFS" -ge 30 ] 2>/dev/null && a "closure-refs" ok || a "closure-refs" "only $REFS"
+
+# THE T-A assertion: offline realise, zero new entries/files
+if [ -n "$DER" ]; then
+  T0=$(date +%s%N)
+  "$NS" -r "$DER" --option substituters '' >/dev/null 2>&1
+  RC=$?
+  T1=$(date +%s%N)
+  echo "offline realise took $(( (T1 - T0) / 1000000 ))ms"
+  [ "$RC" -eq 0 ] && a "offline-realise" ok || a "offline-realise" "rc=$RC"
+  ENTRIES2=$(ls /nix/store | wc -l)
+  RFILES2=$(find /nix/store -maxdepth 1 -mindepth 1 -type f | wc -l)
+  if [ "$ENTRIES2" = "$ENTRIES" ] && [ "$RFILES2" = "$RFILES" ]; then
+    a "zero-new-entries-files" ok
+  else
+    a "zero-new-entries-files" "entries $ENTRIES->$ENTRIES2 files $RFILES->$RFILES2"
+  fi
+else
+  a "offline-realise" "skipped (no drv)"
+fi
+IN
+)
+count_asserts "T-A:" "$TOUT"
+
+# ----------------------------------------------------------------- push (A)
+sec "T-B step 1: guest A creates a NEW path and pushes it"
+PUSHOUT=$(openshell sandbox exec "$A" -- bash -s <<IN 2>&1
+set +e
+NS=\$(cat /opt/seed/nix-store-path)
+echo "$PAYLOAD" > /workspace/dedup-accept.txt
+P=\$("\$NS" --add /workspace/dedup-accept.txt)
+if [ -z "\$P" ]; then echo "@@FAIL add-path (empty)"; else
+  echo "\$P" > /workspace/.accept-path
+  echo "new path: \$P"
+  HELPER=/workspace/OpenShell/openshell-podman/nixcache-push
+  if [ -x "\$HELPER" ]; then
+    "\$HELPER" "\$P" >/dev/null 2>&1 && echo "@@OK push" || echo "@@FAIL push (helper rc=\$?)"
+  else
+    nix --extra-experimental-features nix-command copy --to file:///workspace/.nix-inbox "\$P" >/dev/null 2>&1 \
+      && { echo "@@OK push"; echo "WARN helper not visible in workspace — raw nix copy used"; } \
+      || echo "@@FAIL push (raw copy rc=\$?)"
+  fi
+fi
+IN
+)
+count_asserts "T-B push:" "$PUSHOUT"
+echo "$PUSHOUT" | grep -q 'WARN' && wrn "helper path not visible in workspace (repo outside PROJECTS_DIR?)"
+
+# ------------------------------------------------------- host: auto-ingest
+sec "T-B step 2: host ingest (path unit) + signature assertions"
+P=$(cat "$WS/.accept-path" 2>/dev/null)
+if [ -z "$P" ]; then
+  bad "no store path recorded from guest A — aborting T-B host side"
+else
+  if ! systemctl --user is-active --quiet nix-ingest.path; then
+    wrn "nix-ingest.path not active — will ingest manually"
+  fi
+  for i in $(seq 1 30); do [ -e "$P" ] && break; sleep 3; done
+  if [ ! -e "$P" ]; then
+    wrn "path unit did not auto-ingest within 90s — running ingest.sh manually"
+    "$SCRIPT_DIR/ingest.sh" "$WS/.nix-inbox" || bad "ingest.sh rc=$?"
+    for i in $(seq 1 10); do [ -e "$P" ] && break; sleep 2; done
+  fi
+  [ -e "$P" ] && ok "path ingested into host store" || bad "path not in host store: $P"
+
+  GR="$GCROOTS/$(basename "$P")"
+  [ "$(readlink "$GR" 2>/dev/null)" = "$P" ] \
+    && ok "gcroot pinned" || bad "gcroot missing/wrong: $GR"
+
+  H="$(basename "$P")"; H="${H%%-*}"
+  NINFO=$(curl -fsS --max-time 10 "http://127.0.0.1:5000/$H.narinfo" 2>/dev/null)
+  [ -n "$NINFO" ] && ok "narinfo served (HTTP 200)" || bad "narinfo not served"
+  echo "$NINFO" | grep -qE '^(Sig|Signature): ' \
+    && ok "served narinfo carries host signature" || bad "served narinfo unsigned"
+  if grep -qE '^(Sig|Signature): ' "$RECEIPTS/$H.narinfo" 2>/dev/null; then
+    ok "signed receipt archived"
+  else
+    bad "receipt missing/unsigned: $RECEIPTS/$H.narinfo"
+  fi
+  [ -z "$(ls -A "$WS/.nix-inbox" 2>/dev/null)" ] \
+    && ok "inbox consumed" || bad "inbox not empty"
+fi
+
+# ----------------------------------------------------------------- sandbox B
+sec "T-B step 3: fresh sandbox B sees the path with zero downloads"
+(cd "$SCRIPT_DIR" && PRIVATE_STORE=1 SANDBOX_NAME="$B" ./run-sandbox) \
+  > "$LOGDIR/create-b.log" 2>&1 &
+if wait_ready "$B"; then
+  ok "sandbox B Ready"
+else
+  bad "sandbox B never became Ready (log: $LOGDIR/create-b.log)"
+fi
+if wait_seed "$LOGDIR/create-b.log"; then
+  ok "sandbox B seed complete"
+else
+  bad "sandbox B seed did not complete (log: $LOGDIR/create-b.log)"
+fi
+
+if openshell sandbox get "$B" >/dev/null 2>&1; then
+  BOUT=$(openshell sandbox exec "$B" -- bash -s <<'IN' 2>&1
+set +e
+NS=$(cat /opt/seed/nix-store-path)
+a() { if [ "$2" = ok ]; then echo "@@OK $1"; else echo "@@FAIL $1 ($2)"; fi; }
+P=$(cat /workspace/.accept-path 2>/dev/null)
+if [ -z "$P" ]; then a "path-visible" "no .accept-path in workspace"; else
+  "$NS" --check-validity "$P" 2>/dev/null && a "ingested-path-valid-at-seed" ok \
+    || a "ingested-path-valid-at-seed" "not valid"
+  grep -qxF 'dedup-accept payload v1' "$P" 2>/dev/null \
+    && a "content-from-seed" ok || a "content-from-seed" "content mismatch"
+fi
+[ ! -d ~/.cache/nix ] && a "no-download-cache" ok \
+  || a "no-download-cache" "~/.cache/nix exists (something fetched)"
+ENTRIES=$(ls /nix/store | wc -l)
+[ "$ENTRIES" -ge 4000 ] 2>/dev/null && a "seeded-entries" ok || a "seeded-entries" "only $ENTRIES"
+IN
+  )
+  count_asserts "T-B guest-B:" "$BOUT"
+fi
+
+# ------------------------------------------------------------------- cleanup
+sec "cleanup"
+delete_sandbox "$A"
+delete_sandbox "$B"
+podman unshare rm -rf /tmp/openshell-store.* 2>/dev/null || true
+clean_test_paths
+echo "stages left: $(ls -d /tmp/openshell-store.* 2>/dev/null | wc -l)"
+echo "logs: $LOGDIR"
+
+# ------------------------------------------------------------------- summary
+sec "summary"
+echo "PASS=$PASS FAIL=$FAIL WARN=$WARN"
+if [ "$FAIL" -eq 0 ]; then
+  echo "ACCEPTANCE: PASS"
+  exit 0
+else
+  echo "ACCEPTANCE: FAIL"
+  exit 1
+fi

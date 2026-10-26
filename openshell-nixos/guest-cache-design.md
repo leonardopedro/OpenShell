@@ -3,8 +3,28 @@
 Companion to `dedup.md`. That document closes the **RAM** axis (Route A /
 DAX). This designs the remaining **disk**-axis flow: a package installed
 *inside a guest* must become instantly available to the next guest —
-served from a local cache the guest cannot modify. Design only; nothing
-here is implemented.
+served from a local cache the guest cannot modify. Design only; nothing here is implemented.
+
+**Status (2026-10-26) — podman companion now implements this flow.** The
+`../openshell-podman/` stack (rootless containers, no KVM) runs the same
+architecture end-to-end: the private guest store of §3 P exists as
+`PRIVATE_STORE=1` in `run-sandbox`, with the consumer half realized as a
+**symlink mirror + db seed** (host store directories symlinked into a
+read-only `/opt/host-store`, top-level files copied because `--load-db`
+opens them `O_NOFOLLOW`, host `--dump-db` loaded at boot) so host-known
+paths are already-valid at boot and realize offline in ~94ms with zero
+copies; the producer half is §3 P2's v1 inbox exactly (`nix copy --to
+file://<workspace>/.nix-inbox` → `nix-ingest.path`/`.service` → import +
+gcroot under `~/.local/share/openshell-gcroots`), riding the rw workspace
+share so the cache port stays GET-only (§4). Measured: push auto-ingested
+in ~4s, narinfo HTTP 200, fresh sandbox sees the path valid with zero
+downloads (T-A/T-B in that README); ingest implements §4's first
+mitigations — already-valid paths are never re-imported, and every
+admitted path is archived with a host-*signed* narinfo receipt fetched
+from `nix-serve` — leaving only the strict rebuild mode (mitigation 3)
+open. The VM stack — the subject of this
+document — remains design-only; the deltas, gotchas and measurements live
+in `../openshell-podman/README.md` § Deduplication.
 
 ## 1. Goal, requirements, invariants
 

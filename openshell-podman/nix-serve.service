@@ -1,0 +1,49 @@
+# nix-serve.service — the host half of the nixcache (user unit; this machine
+# is not NixOS, so unlike ../openshell-nixos/nixos-module.nix there is no
+# services.nix-serve to declare — run it the user way instead).
+#
+#   install -Dm644 nix-serve.service ~/.config/systemd/user/nix-serve.service
+#   nix key generate-secret --key-name cache-1 > ~/.config/nix-serve/cache-1.key
+#   nix key convert-secret-to-public < .../cache-1.key > .../cache-1.pub
+#   systemctl --user daemon-reload && systemctl --user enable --now nix-serve
+#
+# Serves the host store read-only over HTTP (narinfo + NARs), signed with the
+# private key below; sandboxes trust the matching public key through the
+# injected nix.conf. 0.0.0.0 rather than loopback: the supervisor reaches the
+# cache at the host's LAN address (the same "LAN only" endpoint the design
+# doc specifies for VM guests), and the store paths served are world-readable
+# on the host anyway. The gateway's policy — sandbox-policy.yaml — is what
+# gates which sandbox binaries may connect.
+[Unit]
+Description=nix-serve binary cache for OpenShell sandboxes
+After=nix-daemon.socket
+
+[Service]
+Type=simple
+# --disable-keepalive is load-bearing (measured 2026-10-26): Starman 0.4018
+# writes the response body for HEAD requests — it consults REQUEST_METHOD only
+# when choosing chunked encoding, then sends $res->[2] unconditionally — so a
+# HEAD (which nix issues before every narinfo GET) leaves the 453-byte body
+# sitting on a connection the client believes is at a message boundary. Any
+# request that reuses that connection then reads "StorePath: ..." as a status
+# line and fails with "Weird server reply (8) Invalid status line", killing
+# that substituter for 60 s. Which side closes first is a race, so the failure
+# is intermittent (~1 in 3). Closing after every response removes the reuse
+# that turns the stray bytes into corruption; localhost/LAN connects are cheap.
+ExecStart=%h/.nix-profile/bin/nix-serve --listen 0.0.0.0:5000 --disable-keepalive
+# Quotes are load-bearing: systemd's Environment= truncates an unquoted value
+# at the first space, and a bare `secret-key-file` makes every request 500
+# ("syntax error in configuration line 'secret-key-file'").
+# nix-serve 0.2 signs narinfos from NIX_SECRET_KEY_FILE (the psgi reads that
+# env var directly — a nix.conf `secret-key-file` alone leaves every narinfo
+# unsigned, and quoting matters in systemd's Environment= as below).
+Environment=NIX_SECRET_KEY_FILE=%h/.config/nix-serve/cache-1.key
+# The user journal records nothing on this machine (no journald user
+# instance), so worker errors land in a file instead of vanishing.
+StandardOutput=append:%h/.local/state/nix-serve.log
+StandardError=append:%h/.local/state/nix-serve.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

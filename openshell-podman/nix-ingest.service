@@ -1,0 +1,7 @@
+[Unit]
+Description=Ingest sandbox-pushed nix closures into the host store (dedup cache)
+
+[Service]
+Type=oneshot
+# Installed by the README (step 7): install -Dm755 ingest.sh ~/.local/libexec/openshell/ingest.sh
+ExecStart=%h/.local/libexec/openshell/ingest.sh %h/Projects/.nix-inbox
