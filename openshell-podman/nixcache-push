@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# nixcache-push — publish store paths from inside a sandbox to the host
+# cache (guest → host half of the dedup loop; guest-cache-design.md §P2).
+#
+# Run INSIDE a sandbox (the workspace is the rw share, so no network rule
+# and no new mount are needed):
+#
+#   ./nixcache-push /nix/store/xxxx…-mypkg        # explicit paths
+#   ./nixcache-push "$(nix path-info …)"          # from a build
+#
+# It writes a standard binary cache (nar + narinfo) into the inbox; the host
+# ingester (ingest.sh / nix-ingest.service) imports it into the host store —
+# from there nix-serve serves it to every other sandbox and host — and pins
+# it with a gcroot. After ingest, every other sandbox gets the path by
+# symlink (dedup), not by download.
+set -euo pipefail
+
+INBOX="${INBOX:-/workspace/.nix-inbox}"
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: nixcache-push <store-path>..." >&2
+  echo "       (default inbox: $INBOX — inside the sandbox this is the shared workspace)" >&2
+  exit 2
+fi
+
+mkdir -p "$INBOX"
+
+# The image ships no nix on PATH — the store does (that is the whole point
+# of the shared store). Prefer PATH, fall back to the store's copy.
+NIX="$(command -v nix || echo "$(ls /nix/store/*-nix-[0-9]*/bin/nix 2>/dev/null | head -1)")"
+if [[ -z "$NIX" || ! -x "$NIX" ]]; then
+  echo "nixcache-push: no nix binary found (PATH or /nix/store)" >&2
+  exit 1
+fi
+
+# nix-command is not enabled in the rendered nix.conf (workloads use legacy
+# nix-env), so pass it explicitly rather than requiring a re-render.
+exec "$NIX" --extra-experimental-features nix-command copy \
+  --to "file://$INBOX" "$@"

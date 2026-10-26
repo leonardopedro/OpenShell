@@ -1,0 +1,56 @@
+# gateway.toml — OpenShell gateway template for a rootless-Podman machine
+# (schema v2, OpenShell 0.1.5). Companion to ../openshell-nixos/gateway.toml,
+# which is the libkrun MicroVM variant for a KVM-capable NixOS host.
+#
+# Where the VM variant exists to share files between host and guest (virtiofs
+# + DAX), this variant gets the same sharing from plain bind mounts: a
+# container shares the host kernel, so a read-only bind of /nix IS the one
+# physical copy on disk AND the one copy in RAM — every sandbox read hits the
+# host page cache directly, with no DAX window to arrange and nothing for KSM
+# to do. The nixcache half (guest NIX_CONFIG, guest-cache-design deltas 2+3)
+# rides the same way: a rendered nix.conf bound in at /etc/nix/nix.conf,
+# pointing at the host's nix-serve (see nix-serve.service and nix.conf here).
+#
+# This file is static — no @HOME@/@SANDBOX_UID@ substitutions. Rootless
+# Podman runs as the gateway user, so the workload identity is the gateway
+# user's own uid by construction (the image's USER, else 1000; on this
+# machine the gateway user IS 1000), which is exactly what the VM driver
+# needed sandbox_uid/sandbox_gid to pin.
+
+[openshell]
+version = 2
+
+[openshell.gateway]
+name = "local-podman"
+# Podman would also be auto-detected (Kubernetes, then Podman, then Docker),
+# but the file states it: this machine runs containers, never microVMs —
+# there is no /dev/kvm here, so the vm driver could never start.
+compute_driver = "podman"
+
+# --- The sharing enablement (this folder's whole point) --------------------
+# Per-sandbox host directory binds: /nix (ro), /var/lib/fnm (ro, when the
+# host has it), ~/Projects (rw), and the rendered nix.conf directory (ro, at
+# /etc/nix). run-sandbox assembles the mounts; the policy (sandbox-policy.yaml)
+# is what makes those paths readable under Landlock.
+#
+# OpenShell requires all three opt-ins below for bind mounts — the same
+# trio the VM template disables/waits on; see ../openshell-nixos/README.md
+# and docs/security/best-practices.mdx for the trust notes before weakening.
+[openshell.drivers.podman]
+allow_driver_config = true
+enable_bind_mounts = true
+
+# Bind mounts are rejected while resource admission is enabled (upstream
+# behavior); the documented companion switch to the two opt-ins above.
+[openshell.drivers.podman.resource_admission]
+enabled = false
+
+# Not set, and deliberately so:
+#   default_image       — the core default (minimal Ubuntu, no agent), and a
+#                         local image named in that registry namespace is
+#                         consulted through the podman socket before pulling.
+#   socket_path         — auto-detected (run/user/<uid>/podman/podman.sock);
+#                         `systemctl --user enable --now podman.socket` first.
+#   network_name        — driver default "openshell": its own netavark
+#                         network, so sandbox containers don't collide with
+#                         anything else on the host.

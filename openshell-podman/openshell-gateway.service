@@ -1,0 +1,45 @@
+# openshell-gateway.service — gateway user unit for a rootless-Podman machine.
+# Adapted from ../openshell-nixos/install.sh's unit (itself adapted from the
+# upstream .deb unit, Apache-2.0): same preflight + cert-generation gates,
+# minus the NixOS PATH pinning and minus OPENSHELL_VM_DAX_WINDOW_MIB — there
+# is no VM driver here, so there is no DAX window to size; the sharing is
+# plain binds (see gateway.toml).
+#
+#   install -Dm644 openshell-gateway.service \
+#       ~/.config/systemd/user/openshell-gateway.service
+#   systemctl --user daemon-reload && systemctl --user enable --now openshell-gateway
+#
+# The gateway binary is the one built from this tree:
+#   cargo build --release -p openshell-cli -p openshell-gateway \
+#       -p openshell-prover --features openshell-prover/prebuilt-z3
+# (prebuilt-z3 ships a static arm64 libz3 — a plain build links -lz3 and
+# fails on a host with no system z3 development package.)
+[Unit]
+Description=OpenShell Gateway (rootless Podman driver)
+Documentation=https://github.com/NVIDIA/OpenShell
+After=default.target
+# The podman user socket must be up for the driver to find it:
+#   systemctl --user enable --now podman.socket
+After=podman.socket
+
+[Service]
+Type=simple
+StateDirectory=openshell/gateway
+Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%E/openshell/gateway.env
+ExecStartPre=%h/.local/bin/openshell-gateway config preflight
+ExecStartPre=%h/.local/bin/openshell-gateway generate-certs --output-dir %h/.local/state/openshell/tls --server-san host.openshell.internal
+ExecStart=%h/.local/bin/openshell-gateway
+# The user journal records nothing on this machine (no journald user
+# instance), so gateway errors — e.g. a missing podman socket — land in a
+# file instead of vanishing: `journalctl --user` would show nothing.
+StandardOutput=append:%h/.local/state/openshell-gateway.log
+StandardError=append:%h/.local/state/openshell-gateway.log
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

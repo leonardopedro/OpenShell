@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch the OpenShell sandbox nix cache inbox (guest -> host store)
+
+[Path]
+# The shared workspace (run-sandbox PROJECTS_DIR) — sandboxes push with
+# nixcache-push into .nix-inbox under it. Non-empty => a push landed (the
+# NAR is written before its narinfo, so an early fire just no-ops and the
+# narinfo's arrival fires again).
+# NOTE: assumes the default PROJECTS_DIR=$HOME/Projects; re-render this line
+# if your workspace lives elsewhere.
+DirectoryNotEmpty=%h/Projects/.nix-inbox
+Unit=nix-ingest.service
+
+[Install]
+WantedBy=default.target

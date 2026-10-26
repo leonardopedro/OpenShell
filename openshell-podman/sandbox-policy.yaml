@@ -1,0 +1,118 @@
+# sandbox-policy.yaml — per-sandbox policy for OpenShell sandboxes on a
+# rootless-Podman machine (OpenShell schema v1; see
+# ../openshell-nixos/sandbox-policy.yaml, which this adapts).
+#
+# Two deltas from the VM policy, both because containers are not microVMs:
+#
+# 1. Network: this policy carries one network rule — the nixcache endpoint
+#    (host nix-serve, port 5000). The VM policy had none, because on the VM
+#    stack nix-serve reachability was still design-only; here the whole point
+#    is that a sandbox's nix can substitute from the host cache
+#    (guest-cache-design step 1). Adding a network rule also auto-adds the
+#    documented baseline filesystem paths — the system paths below are still
+#    re-listed deliberately (they keep the policy honest if the rule is ever
+#    removed, and read_only keeps them read-only either way).
+#
+# 2. Identity: no `process` section, same as the VM policy — but for a
+#    different reason. The VM driver resolved the workload identity from
+#    sandbox_uid/gid in gateway.toml; rootless Podman has no such knob: the
+#    workload runs as the image's USER (default image: none → 1000), and the
+#    gateway user on this machine IS uid 1000, so host files and workload
+#    writes agree without pinning anything.
+#
+# The filesystem half is unchanged in substance: the binds attach in the
+# container, but file *access* is gated by Landlock rules derived from
+# filesystem_policy, whose built-in default is only the workdir plus
+# /bin /usr /lib /etc /tmp — so the shared mounts must be listed here or
+# every open() on them returns EACCES.
+version: 1
+
+filesystem_policy:
+  # With a filesystem_policy section present, include_workdir defaults to
+  # false, so set it explicitly to keep the /sandbox workdir read-write.
+  include_workdir: true
+  read_only:
+    # System paths the workload needs to boot and exec.
+    - /bin
+    - /usr
+    - /lib
+    - /lib64
+    - /etc          # covers /etc/nix/nix.conf, which run-sandbox binds in
+    - /proc
+    - /var/log
+    - /dev/urandom
+    # Optional read-only mirror of the host store (private-store mode: the
+    # sandbox's own tmpfs /nix/store is seeded with symlinks into here, so the
+    # runtime stays reachable while every content path is fetched fresh).
+    - /opt
+    # The shared mounts (host -> container, plain binds — no DAX to arrange:
+    # container reads ARE host page-cache reads).
+    - /nix          # host Nix store (ro): shared libs + nix packages
+    - /var/lib/fnm  # host node install incl. freebuff (ro), when present
+  read_write:
+    - /tmp
+    - /dev/null
+    # pty: nix's build step calls posix_openpt, which opens /dev/ptmx (a symlink
+    # into /dev/pts) **read-write** — a read-only rule lets `ls /dev/pts` work
+    # and still fails the open with EACCES, so without this entry every nix
+    # build inside the sandbox dies with "opening pseudoterminal master:
+    # Permission denied" while substitution itself works fine (measured
+    # 2026-10-26; the string comes from libnixstore.so). /dev/pts is a
+    # kernel-internal filesystem of this container's own ptys, nothing else.
+    - /dev/pts
+    # Private nix store (opt-in). By default /nix is a read-only bind, so these
+    # two rules grant nothing — the mount is the gate. When a sandbox is created
+    # with tmpfs mounts over /nix/store and /nix/var (the podman twin of the VM
+    # design's private overlay store), they make the store writable *inside the
+    # sandbox only*: nothing is pre-valid there, so nix substitutes its inputs
+    # from the host cache and can run real builds. Without a writable store,
+    # every build dies at output creation: builders always target the logical
+    # /nix/store (a rooted `?root=` store only prefixes nix's own I/O), which
+    # is read-only here.
+    - /nix/store
+    - /nix/var
+    - /workspace    # $PROJECTS_DIR (rw): the agent's working tree
+    # read_write cannot contain "/" (schema rule); /workspace is fine.
+
+landlock:
+  # Fail the sandbox start if none of the paths can be applied, instead of
+  # silently degrading to a container with dead mounts. The mandatory
+  # /.openshell baseline already requires Landlock ABI v3 on every driver,
+  # so this adds no new kernel requirement.
+  compatibility: hard_requirement
+
+network_policies:
+  # The nixcache endpoint: the host's nix-serve (nix-serve.service) serves
+  # the store the sandboxes share. protocol: tcp — nix speaks plain HTTP and
+  # OpenShell then only checks host, port and executable (no request rules to
+  # write). binaries takes a glob because the nix binary comes from the
+  # shared, content-addressed store: its path carries the version hash.
+  # Each binary is an object with `path:` — the authored-policy form (the
+  # scalar form is only for provider profiles; a plain string here fails
+  # schema validation with "expected mapping, found string").
+  #
+  # host is `host.openshell.internal`, not the machine's LAN name or IP —
+  # measured 2026-10-25: an IP literal is rejected by policy validation
+  # ("direct IP connections bypass policy DNS and are blocked"), and a LAN
+  # *name* that podman copies into the sandbox's /etc/hosts fails the same
+  # way at runtime, because getaddrinfo resolves it locally and the connect
+  # arrives as a bare IP ("endpoint 10.0.0.108:5000 is not allowed by any
+  # policy"). host.openshell.internal is absent from the sandbox's hosts
+  # file, so Policy DNS resolves it and can match this rule; it is also the
+  # one alias documented to reach services on the gateway host.
+  nix_cache:
+    endpoints:
+      - host: host.openshell.internal
+        port: 5000
+        protocol: tcp
+    binaries:
+      - path: /nix/store/*/bin/nix
+      - path: /nix/store/*/bin/nix-store
+      # Private-store sandboxes (measured 2026-10-26): there the nix runtime
+      # is seeded as *symlinks* into the read-only mirror, so the executable
+      # the kernel shows the connect hook (/proc/<pid>/exe) is the mirror
+      # path, not the store path — every nix connect() then fails with
+      # EACCES ("Permission denied", 11 ms) even though endpoint and
+      # nix-path are both "right". These two are that mirror's twin pair.
+      - path: /opt/host-store/*/bin/nix
+      - path: /opt/host-store/*/bin/nix-store
