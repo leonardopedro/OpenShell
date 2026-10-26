@@ -188,6 +188,16 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
+## Fork Upstream Sync
+
+This repository is a fork of `github.com/NVIDIA/OpenShell`; keep the fork synced with upstream:
+
+- The upstream remote is `upstream` → `git@github.com:NVIDIA/OpenShell.git`. If it is missing (`git remote -v` shows no `upstream`), add it once.
+- At the start of a work session — and periodically in long-running work — run `git fetch upstream`. If `upstream/main` has commits that `HEAD` lacks (`git rev-list --count HEAD..upstream/main` > 0), merge them into `main` and push to `origin` right away.
+- Syncs are direct local merges pushed to the fork — never a pull request for this (matching the project's established sync flow, e.g. `Merge branch 'NVIDIA:main' into main`).
+- Never rebase `main` (it is published); merge only. If the merge conflicts in `Cargo.lock`, prefer upstream's version bumps (they carry security fixes) while keeping version-qualified references consistent with the merged graph, and validate with `cargo metadata --locked` before committing.
+- If the sync is non-trivial (many conflicts, CI files, lockfile regeneration), say so to the user instead of guessing at resolutions.
+
 ## Go SDK (`sdk/go/`)
 
 - The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
