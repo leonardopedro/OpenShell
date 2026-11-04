@@ -40,12 +40,14 @@ What it does, in order:
 
 1. **Preflight** — requires NixOS, `/dev/kvm`, the invoking sudo user;
    reports kvm-group status and where `mke2fs`/`debugfs`/`e2fsck` resolve.
-2. **System module** — renders `/etc/nixos/openshell.nix` from this
-   folder's `nixos-module.nix` template: the package (a *locked*
-   `builtins.getFlake` ref — path + content hash — to this folder's build
-   of the official v0.1.5 `.deb`), the KSM service, the kvm group and
-   loginctl linger. Rewritten only when the render differs, and never
-   over a file whose `managed-by` marker you removed by hand.
+2. **System module** — installs this folder's `openshell-package.nix`
+   (the derivation of the official v0.1.5 `.deb` — a plain file, no
+   flake ref and no narHash pin to go stale) and renders
+   `/etc/nixos/openshell.nix` from the `nixos-module.nix` template:
+   the package (callPackages'd against the system flake's own nixpkgs),
+   the KSM service, the kvm group and loginctl linger. Rewritten only
+   when the render differs, and never over a file whose `managed-by`
+   marker you removed by hand.
 3. **Track + wire** — `git add`s the module if needed (Nix evaluates a
    git worktree through git, so untracked files are invisible to flake
    eval), then adds `./openshell.nix` to the system flake's modules list,
@@ -53,7 +55,8 @@ What it does, in order:
    skips it on reruns; a `flake.nix.bak.openshell` backup is kept).
 4. **Switch** — `nixos-rebuild switch --flake /etc/nixos`: one new system
    generation carrying the package, `ksm-sharing.service`, the kvm group
-   and linger (the package ref is content-locked inline via its narHash —
+   and linger (the package builds from the copied
+   `openshell-package.nix` against the system flake's own nixpkgs —
    `flake.lock` is not touched).
    nixpkgs' own `openshell` package is not used because it is CLI-only
    and stuck at 0.0.116 (schema v1 — it would reject this config).
@@ -182,11 +185,11 @@ Checked here, before delivery:
   `allow_driver_config` / `enable_bind_mounts` / resource admission).
 * `generate-certs` runs and writes the local PKI.
 * **System-config evaluation** — the exact artifacts this installer writes
-  (module rendered with the real `narHash`, user and KSM values;
-  `./openshell.nix` wired with the same anchor `sed`) were produced on a
-  copy of this machine's real `/etc/nixos` flake, then
+  (module rendered with the real user and KSM values, the package file
+  copied, `./openshell.nix` wired with the same anchor `sed`) were
+  produced on a copy of this machine's real `/etc/nixos` flake, then
   `nix eval …#nixosConfigurations.nix2.config.system.build.toplevel.drvPath`
-  → **exit 0**: the `getFlake` package ref, the `ksm-sharing` service, the
+  → **exit 0**: the `callPackage`'d package, the `ksm-sharing` service, the
   `extraGroups` merge and `linger` all type-check inside the full
   home-manager + nix-amd-ai composition, and
   `environment.systemPackages` contains `/nix/store/hsn52…-openshell-0.1.5`

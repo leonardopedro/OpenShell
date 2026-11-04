@@ -16,13 +16,13 @@
   # ---------------------------------------------------------------------------
   # 1 — Package: the CLI, gateway and libkrun VM driver on every user's PATH
   # via the system profile (/run/current-system/sw/bin), which is also first
-  # in the gateway user unit's PATH. The installer substitutes a *locked*
-  # ref (path + narHash of this machine's openshell-nixos folder), so eval
-  # pulls the official v0.1.5 .deb build from the store by content hash —
-  # no re-download, no rebuild, and immune to the folder changing under us
-  # (rerunning install.sh re-syncs the hash when the folder does change).
+  # in the gateway user unit's PATH. install.sh copies this folder's
+  # openshell-package.nix next to this file; callPackage builds it against
+  # the system flake's own nixpkgs. No flake ref and no narHash pin: the
+  # old locked-ref pin staled on every edit of the openshell-nixos folder
+  # and failed the WHOLE system eval with a NAR hash mismatch.
   environment.systemPackages = [
-    (builtins.getFlake "@OPENSHELL_REF@").packages.${pkgs.stdenv.hostPlatform.system}.openshell
+    (pkgs.callPackage ./openshell-package.nix { })
   ];
 
   # ---------------------------------------------------------------------------
