@@ -328,11 +328,14 @@ fn decapsulate(mlkem_ct: &[u8], sk: &KyberSecretKey) -> Result<Vec<u8>, E2eeErro
     Ok(kyber768::decapsulate(&ct, sk).as_bytes().to_vec())
 }
 
-#[cfg(test)]
-pub(crate) mod server_sim {
-    //! Server side of the protocol, used by tests to simulate a chute
-    //! instance: decapsulates request blobs and encrypts responses/stream
-    //! chunks back to the caller's `e2e_response_pk`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod server_sim {
+    //! Server side of the protocol, for driving an edge or client against a
+    //! chute instance that really decapsulates and re-encrypts.
+    //!
+    //! Simulates a chute: decapsulates request blobs and encrypts
+    //! responses/stream chunks back to the caller's `e2e_response_pk`. Exposed
+    //! outside this crate only under the `test-support` feature.
 
     use super::*;
     use std::sync::Mutex;
@@ -343,8 +346,14 @@ pub(crate) mod server_sim {
         nonces: Mutex<u64>,
     }
 
+    impl Default for ChuteInstance {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl ChuteInstance {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             let (pk, sk) = kyber768::keypair();
             Self {
                 pk,
@@ -354,12 +363,12 @@ pub(crate) mod server_sim {
         }
 
         /// Base64 public key as it appears in discovery responses.
-        pub(crate) fn pubkey_b64(&self) -> String {
+        pub fn pubkey_b64(&self) -> String {
             base64::engine::general_purpose::STANDARD.encode(PublicKeyTrait::as_bytes(&self.pk))
         }
 
         /// Single-use nonces, like the real discovery API.
-        pub(crate) fn next_nonce(&self) -> String {
+        pub fn next_nonce(&self) -> String {
             let mut counter = self.nonces.lock().expect("nonce counter poisoned");
             *counter += 1;
             let value = *counter;
@@ -368,7 +377,7 @@ pub(crate) mod server_sim {
 
         /// Decapsulate and decrypt a request blob; returns the augmented JSON
         /// payload (including `e2e_response_pk`).
-        pub(crate) fn decrypt_request(&self, blob: &[u8]) -> Result<String, E2eeError> {
+        pub fn decrypt_request(&self, blob: &[u8]) -> Result<String, E2eeError> {
             let (mlkem_ct, nonce, ciphertext) = split_blob(blob)?;
             let ss = decapsulate(mlkem_ct, &self.sk)?;
             let key = E2eeSession::derive_key(&ss, &mlkem_ct[..HKDF_SALT_LEN], HKDF_INFO_REQ);
@@ -390,7 +399,7 @@ pub(crate) mod server_sim {
 
         /// Encrypt a non-streaming response blob to the caller's
         /// `e2e_response_pk`.
-        pub(crate) fn encrypt_response(
+        pub fn encrypt_response(
             request_json: &str,
             response_json: &str,
         ) -> Result<Vec<u8>, E2eeError> {
@@ -404,7 +413,7 @@ pub(crate) mod server_sim {
         }
 
         /// Produce the `e2e_init` payload and matching stream key.
-        pub(crate) fn stream_init(request_json: &str) -> (String, Vec<u8>) {
+        pub fn stream_init(request_json: &str) -> (String, Vec<u8>) {
             let (_, ss, ct) = Self::response_keypair_b64(request_json);
             let key = E2eeSession::derive_key(&ss, &ct[..HKDF_SALT_LEN], HKDF_INFO_STREAM);
             (
@@ -414,7 +423,7 @@ pub(crate) mod server_sim {
         }
 
         /// Encrypt one SSE chunk with the stream key.
-        pub(crate) fn stream_chunk(
+        pub fn stream_chunk(
             stream_key: &[u8],
             plaintext: &str,
         ) -> Result<String, E2eeError> {

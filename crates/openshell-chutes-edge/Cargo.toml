@@ -26,3 +26,12 @@ reqwest = { workspace = true, features = ["stream"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# `test-support` exposes the E2EE server simulator, so the integration test can
+# run the real binary against an instance that really decapsulates requests.
+openshell-server = { path = "../openshell-server", features = ["test-support"] }
+
+serde_json = { workspace = true }
+tokio = { workspace = true }
+wiremock = "0.6"
