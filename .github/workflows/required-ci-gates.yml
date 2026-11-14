@@ -10,6 +10,7 @@ on:
       - Branch Checks
       - Branch E2E Checks
       - Helm Lint
+      - Packaging Verify
     types: [completed]
 
 permissions:
@@ -285,3 +286,4 @@ jobs:
             post_status "OpenShell / GPU E2E" success "Not applicable: GPU E2E runs only on PRs" "$STATUS_TARGET_URL"
           fi
           evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"
+          evaluate_workflow "OpenShell / Packaging Verify" "packaging-verify.yml" "Packaging Verify"
