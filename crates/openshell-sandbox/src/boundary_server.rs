@@ -6363,8 +6363,8 @@ mod linux {
                 process: openshell_core::policy::ProcessPolicy::default(),
             });
             let spec = AgentSpecWire {
-                program: "/bin/sleep".to_string(),
-                args: vec!["30".to_string()],
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exec sleep 30".to_string()],
                 workdir: None,
                 timeout_secs: 60,
                 interactive: false,
@@ -6476,7 +6476,11 @@ mod linux {
             assert!(matches!(
                 boundary.start_agent(
                     "sandbox-reconnect".to_string(),
-                    AgentSpecWire { program: "/bin/false".to_string(), ..spec },
+                    AgentSpecWire {
+                        program: "/bin/sh".to_string(),
+                        args: vec!["-c".to_string(), "exit 1".to_string()],
+                        ..spec
+                    },
                     None,
                     None,
                     0,
@@ -6666,8 +6670,8 @@ mod linux {
                 network_broker: network_broker.clone(),
             };
             let agent_spec = AgentSpecWire {
-                program: "/bin/true".to_string(),
-                args: Vec::new(),
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
                 workdir: None,
                 timeout_secs: 5,
                 interactive: false,
@@ -6858,8 +6862,8 @@ mod linux {
             );
 
             let sleep_spec = ExecSpecWire {
-                program: "/bin/sleep".to_string(),
-                args: vec!["30".to_string()],
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exec sleep 30".to_string()],
                 shell: None,
                 runtime_helper: None,
                 env: Vec::new(),

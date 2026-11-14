@@ -943,8 +943,8 @@ mod tests {
         let task = tokio::spawn(async move {
             executor
                 .exec(ExecSpec {
-                    program: "/bin/sleep".to_string(),
-                    args: vec!["30".to_string()],
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "exec sleep 30".to_string()],
                     shell: None,
                     runtime_helper: None,
                     env: vec![],
@@ -976,8 +976,8 @@ mod tests {
         let runtime = executor.runtime.clone();
         let spawned = tokio::task::spawn_blocking(move || {
             executor.spawn_piped(&ExecSpec {
-                program: "/bin/sleep".to_string(),
-                args: vec!["30".to_string()],
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exec sleep 30".to_string()],
                 shell: None,
                 runtime_helper: None,
                 env: vec![],
