@@ -10,6 +10,17 @@ use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 
+/// Resolve a host tool through `PATH` instead of assuming an FHS layout.
+/// NixOS has no `/bin/sleep` or `/bin/bash`; an unguarded fixture either
+/// panics or silently skips.
+#[cfg(target_os = "linux")]
+pub fn host_tool(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 #[cfg(target_os = "linux")]
 pub struct SocketHolder(pub Child);
 
@@ -26,7 +37,8 @@ impl Drop for SocketHolder {
 #[cfg(target_os = "linux")]
 pub fn spawn_socket_holder(stream: &TcpStream, exec_sleep: bool) -> SocketHolder {
     let mut command = if exec_sleep {
-        let mut command = Command::new("/bin/sleep");
+        let sleep = host_tool("sleep").expect("sleep on PATH");
+        let mut command = Command::new(sleep);
         command.arg("30");
         command
     } else {
