@@ -12,6 +12,21 @@ use std::process::{Command, Stdio};
 
 use openshell_driver_vm::VmDriverConfig;
 
+/// PATH without the fixture's fake `cp`: the real copy tools, wherever this
+/// host keeps them. Hardcoding `/usr/bin:/bin` drops `cp` entirely on hosts
+/// that install coreutils elsewhere (NixOS).
+fn real_tool_path() -> std::ffi::OsString {
+    std::env::var_os("PATH").unwrap_or_default()
+}
+
+/// Create the FIFO a fixture copy blocks on. A shell `read` from a FIFO with
+/// no writer blocks without needing `sleep` on PATH.
+fn make_blocking_fifo(path: &std::path::Path) {
+    let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: `raw` is a valid NUL-terminated path and mkfifo only creates it.
+    assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "create fifo");
+}
+
 /// Exercise the actual worker entry point and a real sparse-file copy without
 /// downloading an image, running a VM, or requiring host filesystem utilities.
 #[test]
@@ -108,18 +123,23 @@ fn worker_overlay_case(interrupt_retry: bool) {
         let tools = root.path().join("tools");
         fs::create_dir(&tools).unwrap();
         let copy_ready = root.path().join("copy-ready");
+        let copy_block = root.path().join("copy-block");
+        make_blocking_fifo(&copy_block);
         let cp = tools.join("cp");
         // Control only the external copy command. The actual worker selects
         // the destination and executes its production preservation checks.
+        // The trailing `read` blocks the copy until the worker is killed;
+        // `sleep` is not guaranteed to be on a minimal PATH.
         fs::write(
             &cp,
-            "#!/bin/sh\nfor argument in \"$@\"; do destination=\"$argument\"; done\nprintf partial > \"$destination\"\nprintf '%s' \"$destination\" > \"$COPY_READY\"\nsleep 300\n",
+            "#!/bin/sh\nfor argument in \"$@\"; do destination=\"$argument\"; done\nprintf partial > \"$destination\"\nprintf '%s' \"$destination\" > \"$COPY_READY\"\nread _ < \"$COPY_BLOCK\"\n",
         )
         .unwrap();
         fs::set_permissions(&cp, fs::Permissions::from_mode(0o700)).unwrap();
         command
             .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
-            .env("COPY_READY", &copy_ready);
+            .env("COPY_READY", &copy_ready)
+            .env("COPY_BLOCK", &copy_block);
         let mut interrupted = command.spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !copy_ready.exists() && std::time::Instant::now() < deadline {
@@ -139,17 +159,18 @@ fn worker_overlay_case(interrupt_retry: bool) {
         }
         interrupted.wait().unwrap();
         assert!(copy_ready.exists(), "worker must reach the controlled copy");
+        let destination = fs::read_to_string(&copy_ready).unwrap();
         assert!(
             !sandbox.join("overlay.ext4").exists(),
             "interrupted retry must leave no partial persisted overlay"
         );
-        let destination = fs::read_to_string(&copy_ready).unwrap();
         assert!(std::path::Path::new(&destination).starts_with(&attempt));
         // Retry using the real copy utility. The incomplete attempt image
         // must not prevent publishing the complete overlay.
         command
-            .env("PATH", "/usr/bin:/bin")
-            .env_remove("COPY_READY");
+            .env("PATH", real_tool_path())
+            .env_remove("COPY_READY")
+            .env_remove("COPY_BLOCK");
     }
     let mut child = command.spawn().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -294,9 +315,10 @@ fn spawn_overlay_fixture(
                 "PATH",
                 format!("{}:/usr/bin:/bin", root.join("tools").display()),
             )
-            .env("COPY_READY", root.join("copy-ready"));
+            .env("COPY_READY", root.join("copy-ready"))
+            .env("COPY_BLOCK", root.join("copy-block"));
     } else {
-        command.env("PATH", "/usr/bin:/bin");
+        command.env("PATH", real_tool_path());
     }
     // SAFETY: only fcntl runs between fork and exec; the guard keeps fd alive.
     unsafe {
@@ -330,8 +352,9 @@ fn independent_overlay_finishes_while_another_copy_is_blocked() {
     let tools = root.path().join("tools");
     fs::create_dir(&tools).unwrap();
     fs::write(tools.join("cp"),
-        "#!/bin/sh\nfor value in \"$@\"; do destination=\"$value\"; done\nprintf partial > \"$destination\"\n: > \"$COPY_READY\"\nexec sleep 300\n"
+        "#!/bin/sh\nfor value in \"$@\"; do destination=\"$value\"; done\nprintf partial > \"$destination\"\n: > \"$COPY_READY\"\nread _ < \"$COPY_BLOCK\"\n"
     ).unwrap();
+    make_blocking_fifo(&root.path().join("copy-block"));
     fs::set_permissions(tools.join("cp"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut slow = spawn_overlay_fixture(root.path(), "slow-a", 1, true);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
