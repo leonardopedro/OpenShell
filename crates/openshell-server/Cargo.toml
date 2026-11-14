@@ -106,6 +106,8 @@ chacha20poly1305 = { workspace = true }
 hkdf = { workspace = true }
 flate2 = { workspace = true }
 pqcrypto-kyber = { workspace = true }
+# Pinned-TLS support (CHUTES_TLS_SPKI_PINS) needs the platform root store.
+rustls-native-certs = { workspace = true }
 pqcrypto-traits = { workspace = true }
 getrandom = { workspace = true }
 jsonwebtoken = { workspace = true }

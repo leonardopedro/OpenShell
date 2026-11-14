@@ -230,6 +230,7 @@ fn upstream_config(server_uri: &str, default_api_key: Option<&str>) -> ChutesCon
         e2e_invoke: format!("{server_uri}/e2e/invoke"),
         timeout_secs: 30,
         default_api_key: default_api_key.map(str::to_owned),
+        tls_spki_pins: Vec::new(),
     }
 }
 

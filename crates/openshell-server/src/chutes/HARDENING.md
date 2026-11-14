@@ -42,30 +42,33 @@ trust anchor is the CA set, not the TEE.
 
 Mitigations, cheapest first:
 
-1. **SPKI pin** (recommended): an optional `CHUTES_TLS_SPKI_PINS`
-   (base64 SHA-256 of the certificate's SubjectPublicKeyInfo, comma separated)
-   enforced with a custom rustls verifier, so only the pinned leaf/intermediate
-   chain is accepted for `api_base`/`llm_base`/`e2e_invoke` hosts.
-2. **Pubkey TOFU**: remember `chute_id -> instance_id -> e2e_pubkey` on first
+1. **SPKI pin** (implemented): `CHUTES_TLS_SPKI_PINS` takes comma-separated
+   base64 SHA-256 digests of the leaf `SubjectPublicKeyInfo`, enforced by the
+   verifier in `tls.rs`. Chain and hostname validation still run first, so a
+   pin can only narrow what the platform roots already accept. Unset means
+   "trust the platform roots" — the default for compatibility with the
+   reference implementations. Malformed pins are a startup error rather than
+   a silent downgrade.
+2. **Pubkey TOFU** (not implemented): remember `chute_id -> instance_id -> e2e_pubkey` on first
    successful use and warn or fail when discovery later returns a different key
    for the same instance id. This does not stop a first-use MITM but turns
    silent long-term interception into a detectable event.
-3. **Attestation**: when Chutes exposes a signed attestation/report digest for
+3. **Attestation** (not implemented): when Chutes exposes a signed attestation/report digest for
    the instance, verify it binds `e2e_pubkey` to the expected enclave
    measurement, and keep it in the discovery cache alongside the key.
 
 ### H2. Redirects and proxy env vars can move credentials off-host (medium)
 
-`reqwest` follows up to 10 redirects by default and honours `HTTP(S)_PROXY`.
-A redirect from the API host could carry `Authorization: Bearer <key>` to
-another origin, and an environment proxy silently inserts itself into the
-"end-to-end" path. Recommend `redirect(reqwest::redirect::Policy::none())` and
-an explicit decision on proxies (`no_proxy()`, or opt-in via config).
+**Partially implemented.** The client now sets
+`redirect(reqwest::redirect::Policy::none())`, so a `30x` from the API host can
+no longer move `Authorization` (or the encrypted body) to another origin.
+Endpoints are also validated at client construction: `api_base`, `llm_base` and
+`e2e_invoke` must be `https`, with `http` accepted only for loopback hosts (which
+keeps the wiremock-based tests and local upstreams working).
 
-Related: `e2e_invoke`, `api_base` and `llm_base` are env-configured with no
-host allowlist. They are trusted configuration, so this is low risk, but
-validating them as `https://` URLs at config parse time prevents a misconfigured
-`http://` endpoint from silently downgrading the whole scheme.
+Remaining: `reqwest` still honours `HTTP(S)_PROXY`, so an environment proxy can
+insert itself into the "end-to-end" path; decide on `no_proxy()` or an explicit
+opt-in setting.
 
 ### H3. Stream chunks are neither deduplicated nor ordered (medium)
 
@@ -79,10 +82,13 @@ A relay can therefore:
   normal, since nothing binds a chunk to its position;
 - **inject** a chunk from an earlier part of the same stream.
 
-The AEAD stops forgery but not reordering. Recommend a per-session
-`HashSet<[u8; 12]>` of seen chunk nonces, treating a repeat as a protocol error,
-plus a monotonic sequence check if the server ever adds one. At minimum, count
-and log duplicates so a relayed stream is visible in metrics.
+The AEAD stops forgery but not reordering.
+
+**Partially implemented.** `SseDecryptor` now keeps a `HashSet` of accepted
+chunk nonces and fails the stream on a duplicate (`e2e stream chunk replay
+detected`), which turns token duplication by a relay into a visible error.
+Dropping and reordering are still accepted, because the protocol carries no
+sequence number or chunk counter; revisit if the server adds one.
 
 ### H4. No zeroization of session secrets (low)
 

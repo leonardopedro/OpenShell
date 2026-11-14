@@ -26,6 +26,7 @@
 //! | `CHUTES_LLM_BASE` | `https://llm.chutes.ai/v1` |
 //! | `CHUTES_E2E_INVOKE` | `https://api.chutes.ai/e2e/invoke` |
 //! | `CHUTES_TIMEOUT_SECS` | `600` |
+//! | `CHUTES_TLS_SPKI_PINS` | — (base64 SHA-256 SPKI pins for the upstream chain) |
 //!
 //! Auth: callers present their own Chutes key as
 //! `Authorization: Bearer <key>`; the environment key is only a fallback
@@ -34,6 +35,7 @@
 mod client;
 pub mod e2ee;
 mod stream;
+mod tls;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +75,9 @@ pub struct ChutesConfig {
     pub timeout_secs: u64,
     /// API key used when the caller sends no `Authorization` header.
     pub default_api_key: Option<String>,
+    /// Accepted leaf `SubjectPublicKeyInfo` pins for the upstream TLS chain.
+    /// Empty means "trust the platform roots" (the default).
+    pub tls_spki_pins: Vec<tls::SpkiPin>,
 }
 
 impl Default for ChutesConfig {
@@ -83,8 +88,24 @@ impl Default for ChutesConfig {
             e2e_invoke: DEFAULT_E2E_INVOKE.to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             default_api_key: None,
+            tls_spki_pins: Vec::new(),
         }
     }
+}
+
+/// Parse `CHUTES_TLS_SPKI_PINS` (comma-separated base64 SHA-256 digests).
+///
+/// A malformed pin is a startup configuration error: silently trusting the
+/// platform roots instead would defeat the point of configuring pins.
+fn parse_spki_pins(raw: &str) -> Vec<tls::SpkiPin> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            tls::decode_pin(entry)
+                .unwrap_or_else(|error| panic!("invalid CHUTES_TLS_SPKI_PINS entry: {error}"))
+        })
+        .collect()
 }
 
 impl ChutesConfig {
@@ -102,6 +123,8 @@ impl ChutesConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
             default_api_key: env("CHUTES_API_KEY"),
+            tls_spki_pins: env("CHUTES_TLS_SPKI_PINS")
+                .map_or_else(Vec::new, |raw| parse_spki_pins(&raw)),
         }
     }
 }

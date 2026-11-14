@@ -18,7 +18,7 @@
 //! that asked for `stream: false` (the proxy always asks upstream for
 //! `stream: true`, matching the reference implementation).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -70,6 +70,9 @@ pub struct SseDecryptor {
     session: E2eeSession,
     stream_key: Option<Vec<u8>>,
     leftover: String,
+    /// Nonces of chunks already accepted in this stream. A repeat means a
+    /// relay replayed ciphertext, which would otherwise duplicate output.
+    seen_chunks: HashSet<[u8; 12]>,
 }
 
 impl SseDecryptor {
@@ -78,6 +81,7 @@ impl SseDecryptor {
             session,
             stream_key: None,
             leftover: String::new(),
+            seen_chunks: HashSet::new(),
         }
     }
 
@@ -154,6 +158,13 @@ impl SseDecryptor {
                 warn!("received e2e chunk before e2e_init; dropping");
                 return Ok(());
             };
+            let nonce = E2eeSession::chunk_nonce(chunk)
+                .map_err(|e| format!("e2e chunk decrypt failed: {e}"))?;
+            if !self.seen_chunks.insert(nonce) {
+                return Err(
+                    "e2e stream chunk replay detected (duplicate chunk nonce)".to_string()
+                );
+            }
             let plaintext = self
                 .session
                 .decrypt_stream_chunk(chunk, key)
@@ -525,6 +536,30 @@ mod tests {
             !items.iter().any(|i| matches!(i, SseItem::Data { .. })),
             "pre-init chunk must not surface as data"
         );
+    }
+
+    #[test]
+    fn rejects_replayed_stream_chunk() {
+        let (_instance, session, decrypted) = instance_session();
+        let (init, key) = ChuteInstance::stream_init(&decrypted);
+        let chunk = ChuteInstance::stream_chunk(
+            &key,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"once\"}}]}\n\n",
+        )
+        .expect("chunk");
+
+        let mut decryptor = SseDecryptor::new(session);
+        decryptor
+            .feed(&format!("data: {{\"e2e_init\":\"{init}\"}}\n\n"))
+            .expect("init");
+        decryptor
+            .feed(&format!("data: {{\"e2e\":\"{chunk}\"}}\n\n"))
+            .expect("first chunk accepted");
+
+        let error = decryptor
+            .feed(&format!("data: {{\"e2e\":\"{chunk}\"}}\n\n"))
+            .expect_err("replayed chunk must be rejected");
+        assert!(error.contains("replay"), "error: {error}");
     }
 
     #[test]

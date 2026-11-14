@@ -192,6 +192,25 @@ impl E2eeSession {
         Ok(key.to_vec())
     }
 
+    /// The ChaCha20-Poly1305 nonce of one `e2e` stream chunk.
+    ///
+    /// Lets the stream decryptor reject a replayed chunk before decrypting it:
+    /// AEAD stops forgery, but not a relay handing the same ciphertext over
+    /// twice.
+    pub fn chunk_nonce(enc_chunk_b64: &str) -> Result<[u8; CHACHA_NONCE_SIZE], E2eeError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(enc_chunk_b64)
+            .map_err(|e| E2eeError::DecryptionFailed(format!("base64 chunk: {e}")))?;
+        if raw.len() < CHACHA_NONCE_SIZE + CHACHA_TAG_SIZE {
+            return Err(E2eeError::DecryptionFailed(
+                "stream chunk too short".to_string(),
+            ));
+        }
+        let mut nonce = [0u8; CHACHA_NONCE_SIZE];
+        nonce.copy_from_slice(&raw[..CHACHA_NONCE_SIZE]);
+        Ok(nonce)
+    }
+
     /// Decrypt one `e2e` stream chunk (base64 `nonce||ct||tag`) with the
     /// stream key from [`Self::decrypt_stream_init`].
     pub fn decrypt_stream_chunk(
