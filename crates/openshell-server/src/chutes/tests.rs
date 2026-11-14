@@ -231,7 +231,20 @@ fn upstream_config(server_uri: &str, default_api_key: Option<&str>) -> ChutesCon
         timeout_secs: 30,
         default_api_key: default_api_key.map(str::to_owned),
         tls_spki_pins: Vec::new(),
+        proxy: ProxyPolicy::None,
     }
+}
+
+#[test]
+fn proxy_policy_parses_env_values() {
+    assert_eq!(ProxyPolicy::parse(None), ProxyPolicy::None);
+    assert_eq!(ProxyPolicy::parse(Some("")), ProxyPolicy::None);
+    assert_eq!(ProxyPolicy::parse(Some("none")), ProxyPolicy::None);
+    assert_eq!(ProxyPolicy::parse(Some("env")), ProxyPolicy::Environment);
+    assert_eq!(
+        ProxyPolicy::parse(Some(" http://proxy.internal:8080 ")),
+        ProxyPolicy::Url("http://proxy.internal:8080".to_string())
+    );
 }
 
 fn chat_request(model: &str, stream: bool) -> Value {

@@ -59,16 +59,18 @@ Mitigations, cheapest first:
 
 ### H2. Redirects and proxy env vars can move credentials off-host (medium)
 
-**Partially implemented.** The client now sets
-`redirect(reqwest::redirect::Policy::none())`, so a `30x` from the API host can
-no longer move `Authorization` (or the encrypted body) to another origin.
-Endpoints are also validated at client construction: `api_base`, `llm_base` and
-`e2e_invoke` must be `https`, with `http` accepted only for loopback hosts (which
-keeps the wiremock-based tests and local upstreams working).
+**Implemented.** The client sets `redirect(reqwest::redirect::Policy::none())`,
+so a `30x` from the API host can no longer move `Authorization` (or the
+encrypted body) to another origin. Endpoints are validated at client
+construction: `api_base`, `llm_base` and `e2e_invoke` must be `https`, with
+`http` accepted only for loopback hosts (which keeps the wiremock-based tests
+and local upstreams working).
 
-Remaining: `reqwest` still honours `HTTP(S)_PROXY`, so an environment proxy can
-insert itself into the "end-to-end" path; decide on `no_proxy()` or an explicit
-opt-in setting.
+Proxy use is now explicit: `CHUTES_PROXY` accepts `none` (the default, which
+calls `no_proxy()` and ignores `HTTP(S)_PROXY`), `env` (honour the environment
+like a generic HTTP client), or a proxy URL that all upstream requests go
+through. A proxy the operator did not choose therefore never sits inside the
+"end-to-end" path.
 
 ### H3. Stream chunks are neither deduplicated nor ordered (medium)
 

@@ -27,6 +27,7 @@
 //! | `CHUTES_E2E_INVOKE` | `https://api.chutes.ai/e2e/invoke` |
 //! | `CHUTES_TIMEOUT_SECS` | `600` |
 //! | `CHUTES_TLS_SPKI_PINS` | — (base64 SHA-256 SPKI pins for the upstream chain) |
+//! | `CHUTES_PROXY` | `none` (`env` honours `HTTP(S)_PROXY`, or a proxy URL) |
 //!
 //! Auth: callers present their own Chutes key as
 //! `Authorization: Bearer <key>`; the environment key is only a fallback
@@ -62,6 +63,33 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
 
+/// How the upstream client treats proxies.
+///
+/// `None` is the default: the E2EE hop should not be silently routed through
+/// whatever proxy the process environment happens to describe. Operators opt
+/// in explicitly, either by pointing at a proxy URL or by saying they want
+/// the environment honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyPolicy {
+    /// Ignore proxy environment variables entirely.
+    None,
+    /// Honour `HTTP(S)_PROXY` / `NO_PROXY` like a generic HTTP client.
+    Environment,
+    /// Send every upstream request through this proxy URL.
+    Url(String),
+}
+
+impl ProxyPolicy {
+    /// Parse a `CHUTES_PROXY` value: `none`/unset, `env`, or a proxy URL.
+    pub(crate) fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("" | "none") => Self::None,
+            Some("env" | "environment") => Self::Environment,
+            Some(url) => Self::Url(url.to_string()),
+        }
+    }
+}
+
 /// Upstream endpoints and fallbacks for the Chutes proxy.
 #[derive(Debug, Clone)]
 pub struct ChutesConfig {
@@ -78,6 +106,8 @@ pub struct ChutesConfig {
     /// Accepted leaf `SubjectPublicKeyInfo` pins for the upstream TLS chain.
     /// Empty means "trust the platform roots" (the default).
     pub tls_spki_pins: Vec<tls::SpkiPin>,
+    /// Proxy policy for upstream requests.
+    pub proxy: ProxyPolicy,
 }
 
 impl Default for ChutesConfig {
@@ -89,6 +119,7 @@ impl Default for ChutesConfig {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             default_api_key: None,
             tls_spki_pins: Vec::new(),
+            proxy: ProxyPolicy::None,
         }
     }
 }
@@ -125,6 +156,7 @@ impl ChutesConfig {
             default_api_key: env("CHUTES_API_KEY"),
             tls_spki_pins: env("CHUTES_TLS_SPKI_PINS")
                 .map_or_else(Vec::new, |raw| parse_spki_pins(&raw)),
+            proxy: ProxyPolicy::parse(env("CHUTES_PROXY").as_deref()),
         }
     }
 }

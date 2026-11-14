@@ -193,4 +193,76 @@ mod tests {
             .expect_err("mismatched pin rejected");
         assert!(format!("{error}").contains("pin mismatch"));
     }
+
+    /// End-to-end handshake: a real TLS server, reqwest over the pinned
+    /// config, and a pin that does not match the presented leaf.
+    #[tokio::test]
+    async fn pinned_client_rejects_wrong_pin_during_handshake() {
+        let ca_key = openshell_crypto::pki::generate_keypair().expect("ca key");
+        let mut ca_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key).expect("ca cert");
+
+        let leaf_key = openshell_crypto::pki::generate_keypair().expect("leaf key");
+        let mut leaf_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        leaf_params.subject_alt_names = vec![rcgen::SanType::IpAddress(std::net::IpAddr::from(
+            [127, 0, 0, 1],
+        ))];
+        let leaf = openshell_crypto::pki::signed_by(leaf_params, &leaf_key, &ca_cert, &ca_key)
+            .expect("leaf cert");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).expect("trust the test ca");
+
+        let key_der = leaf_key.serialize_der().expect("leaf key der");
+        let server_config = rustls::ServerConfig::builder_with_provider(
+            openshell_crypto::tls::ensure_default_provider().clone(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("default versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone(), ca_cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(key_der).expect("private key"),
+        )
+        .expect("server config");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            // The handshake is expected to fail on the client side.
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let client_config = pinned_client_config_with_roots(&[[0xAB; 32]], roots)
+            .expect("pinned client config");
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .use_preconfigured_tls(client_config)
+            .build()
+            .expect("http client");
+        let error = http
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("wrong pin must fail the request");
+        let mut message = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            message.push_str(" | ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        assert!(
+            message.contains("pin mismatch"),
+            "expected a pin mismatch, got: {message}"
+        );
+        server.await.expect("server task");
+    }
 }

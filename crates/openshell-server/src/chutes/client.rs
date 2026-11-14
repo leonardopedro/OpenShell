@@ -24,6 +24,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use super::ChutesConfig;
+use super::ProxyPolicy;
 use super::e2ee::{self, E2eeSession};
 
 /// One discoverable chute instance.
@@ -116,6 +117,15 @@ impl ChutesClient {
             // Never follow a redirect: a 30x from the API host could move the
             // bearer token, and the E2EE handshake body is bound to one host.
             .redirect(reqwest::redirect::Policy::none());
+        builder = match &config.proxy {
+            // Explicitly ignore HTTP(S)_PROXY: a proxy the operator did not
+            // choose should not sit in the "end-to-end" path.
+            ProxyPolicy::None => builder.no_proxy(),
+            ProxyPolicy::Environment => builder,
+            ProxyPolicy::Url(url) => builder.proxy(reqwest::Proxy::all(url).unwrap_or_else(
+                |error| panic!("CHUTES_PROXY is not a valid proxy URL ({url}): {error}"),
+            )),
+        };
         if !config.tls_spki_pins.is_empty() {
             let tls = super::tls::pinned_client_config(&config.tls_spki_pins)
                 .unwrap_or_else(|error| panic!("failed to build pinned chutes tls config: {error}"));
