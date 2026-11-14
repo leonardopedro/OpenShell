@@ -211,11 +211,31 @@ EnvironmentFile=-/etc/openshell/chutes-edge.env
 ExecStart=/usr/bin/openshell-chutes-edge
 Restart=on-failure
 RestartSec=5
+# The HTTP server traps SIGINT for a graceful shutdown and ignores SIGTERM.
+KillSignal=SIGINT
 NoNewPrivileges=yes
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
 PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
 ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
 ProtectSystem=strict
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
