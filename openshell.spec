@@ -107,6 +107,7 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-prover"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-chutes-edge"
 
 # Generate vendored crate manifest and license metadata.
 # cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
@@ -128,6 +129,9 @@ install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-prover" %{buildroo
 
 # --- Gateway binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
+
+# --- Chutes edge binary ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-chutes-edge" %{buildroot}%{_bindir}/%{name}-chutes-edge
 
 # --- Default gateway TOML config template ---
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
@@ -188,6 +192,35 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 WantedBy=default.target
 EOF
 
+# --- Chutes edge systemd system unit ---
+# The edge serves one shared upstream key, so unlike the gateway it is not tied
+# to a user session. The key is supplied through the environment file, which
+# the unit itself does not create.
+install -d %{buildroot}%{_unitdir}
+cat > %{buildroot}%{_unitdir}/%{name}-chutes-edge.service << 'EOF'
+[Unit]
+Description=OpenShell Chutes Edge
+Documentation=https://github.com/NVIDIA/OpenShell
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=-/etc/openshell/chutes-edge.env
+ExecStart=/usr/bin/openshell-chutes-edge
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
 install -pm 0644 deploy/rpm/QUICKSTART.md %{buildroot}%{_docdir}/%{name}-gateway/QUICKSTART.md
@@ -244,6 +277,9 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # Smoke-test the gateway binary
 %{buildroot}%{_bindir}/%{name}-gateway --version
 
+# Smoke-test the Chutes edge frontend
+%{buildroot}%{_bindir}/%{name}-chutes-edge --version
+
 # Smoke-test the Python SDK version metadata via importlib.metadata.
 # We query the dist-info directly rather than importing the package because
 # the full import pulls in grpcio and other runtime deps not present in the
@@ -279,12 +315,15 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 
 %post gateway
 %systemd_user_post %{name}-gateway.service
+%systemd_post %{name}-chutes-edge.service
 
 %preun gateway
 %systemd_user_preun %{name}-gateway.service
+%systemd_preun %{name}-chutes-edge.service
 
 %postun gateway
 %systemd_user_postun_with_restart %{name}-gateway.service
+%systemd_postun_with_restart %{name}-chutes-edge.service
 
 %files
 %license LICENSE
@@ -308,7 +347,9 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 %doc %{_docdir}/%{name}-gateway/CONFIGURATION.md
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
+%{_bindir}/%{name}-chutes-edge
 %{_userunitdir}/%{name}-gateway.service
+%{_unitdir}/%{name}-chutes-edge.service
 %{_libexecdir}/%{name}-gateway-migrate-config
 %{_datadir}/%{name}-gateway/gateway.toml.default
 %{_datadir}/%{name}-gateway/gateway.toml.default.v1

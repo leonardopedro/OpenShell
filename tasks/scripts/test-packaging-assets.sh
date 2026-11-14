@@ -38,6 +38,7 @@ assert_file_exists() {
 }
 
 service="${ROOT}/deploy/deb/openshell-gateway.service"
+edge_service="${ROOT}/deploy/deb/openshell-chutes-edge.service"
 control="${ROOT}/deploy/deb/control.in"
 spec="${ROOT}/openshell.spec"
 package_qualification="${ROOT}/tests/tmachine/ansible/roles/openshell_packaged_gateway/tasks/main.yaml"
@@ -47,6 +48,7 @@ tmachine_podman_config="${ROOT}/tests/tmachine/ansible/roles/openshell_gateway/t
 development_gateway="${ROOT}/nix/test-guest/provisioners/roles/gateway-podman/tasks/development-gateway.yml"
 
 assert_file_exists "$service"
+assert_file_exists "$edge_service"
 assert_file_exists "$control"
 assert_file_exists "$spec"
 assert_file_exists "$package_qualification"
@@ -86,6 +88,15 @@ assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
 assert_contains "$spec" 'ExecStartPre=/usr/bin/openshell-gateway config preflight'
+
+# The Chutes edge ships in the same packages as the gateway. Its unit is
+# system-scope because it fronts one shared upstream key rather than a session.
+assert_contains "$edge_service" 'ExecStart=/usr/bin/openshell-chutes-edge'
+assert_contains "$edge_service" 'EnvironmentFile=-/etc/openshell/chutes-edge.env'
+assert_contains "$edge_service" 'DynamicUser=yes'
+assert_contains "$spec" '%{_bindir}/%{name}-chutes-edge'
+assert_contains "$spec" '%{_unitdir}/%{name}-chutes-edge.service'
+assert_contains "$spec" 'ExecStart=/usr/bin/openshell-chutes-edge'
 assert_contains "$spec" '%package prover'
 assert_contains "$spec" '%files prover'
 assert_contains "$spec" '%{_bindir}/%{name}-prover'
@@ -141,6 +152,9 @@ assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
 assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
+assert_contains "$package_deb" "\$src_dir/openshell-chutes-edge.service"
+assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/system/openshell-chutes-edge.service"
+assert_contains "$package_deb" "\$pkgroot/usr/bin/openshell-chutes-edge"
 assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]'
 assert_contains "$snap_wrapper" '[ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]'
 assert_contains "$snap_wrapper" 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"'
@@ -298,7 +312,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   package_work=$(mktemp -d "${TMPDIR:-/tmp}/openshell-package-assets.XXXXXX")
   trap 'rm -rf "$package_work"' EXIT
   mkdir -p "$package_work/bin" "$package_work/output"
-  for binary in openshell openshell-gateway openshell-prover openshell-driver-vm; do
+  for binary in openshell openshell-gateway openshell-prover openshell-driver-vm openshell-chutes-edge; do
     printf '#!/bin/sh\nexit 0\n' >"$package_work/bin/$binary"
     chmod +x "$package_work/bin/$binary"
   done
@@ -306,6 +320,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     OPENSHELL_GATEWAY_BINARY="$package_work/bin/openshell-gateway" \
     OPENSHELL_PROVER_BINARY="$package_work/bin/openshell-prover" \
     OPENSHELL_DRIVER_VM_BINARY="$package_work/bin/openshell-driver-vm" \
+    OPENSHELL_CHUTES_EDGE_BINARY="$package_work/bin/openshell-chutes-edge" \
     OPENSHELL_DEB_VERSION=0.0.0 \
     OPENSHELL_DEB_ARCH=amd64 \
     OPENSHELL_OUTPUT_DIR="$package_work/output" \
@@ -315,6 +330,18 @@ if command -v dpkg-deb >/dev/null 2>&1; then
       >"$package_work/staged.service"
   if ! cmp -s "$service" "$package_work/staged.service"; then
     echo "FAIL: package-deb did not stage the current Debian service" >&2
+    exit 1
+  fi
+  dpkg-deb --fsys-tarfile "$package_work/output/openshell_0.0.0_amd64.deb" \
+    | tar -xOf - ./usr/lib/systemd/system/openshell-chutes-edge.service \
+      >"$package_work/staged-edge.service"
+  if ! cmp -s "$edge_service" "$package_work/staged-edge.service"; then
+    echo "FAIL: package-deb did not stage the current Chutes edge service" >&2
+    exit 1
+  fi
+  if ! dpkg-deb --fsys-tarfile "$package_work/output/openshell_0.0.0_amd64.deb" \
+    | tar -tf - | grep -x './usr/bin/openshell-chutes-edge' >/dev/null; then
+    echo "FAIL: package-deb did not stage openshell-chutes-edge" >&2
     exit 1
   fi
   if ! dpkg-deb --fsys-tarfile "$package_work/output/openshell_0.0.0_amd64.deb" \

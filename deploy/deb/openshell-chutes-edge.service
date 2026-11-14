@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=OpenShell Chutes Edge
+Documentation=https://github.com/NVIDIA/OpenShell
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The edge keeps no state and owns no files, so it runs from an unprivileged
+# ephemeral account. Its Chutes API key is the only input it needs; it is read
+# from the environment file below rather than from the unit so the key never
+# lands in a world-readable drop-in.
+DynamicUser=yes
+EnvironmentFile=-/etc/openshell/chutes-edge.env
+ExecStart=/usr/bin/openshell-chutes-edge
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -379,7 +379,22 @@ async fn write_stream(
     session.write_response_body(None, true).await
 }
 
+/// The identity printed for `--version`. Package builds verify every binary
+/// by running it, so the edge has to answer that question instead of turning
+/// it into a listen request and running forever.
+fn version_line() -> String {
+    format!("openshell-chutes-edge {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn main() {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version_line());
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -407,6 +422,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_reports_the_binary_name() {
+        let line = version_line();
+        assert!(line.starts_with("openshell-chutes-edge "), "{line}");
+        assert_ne!(line.trim(), "openshell-chutes-edge");
+    }
 
     #[test]
     fn bearer_tokens_are_trimmed_and_empty_values_rejected() {
