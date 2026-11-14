@@ -60,6 +60,19 @@ command -v freebuff                   # must sit next to node
 `freebuff` must be in the **same directory** as `node` (that is what a
 plain `npm -g` under that node gives you).
 
+Then **run it once on the host**:
+
+```sh
+freebuff --version     # first launch downloads the native binary
+```
+
+That first run stages Freebuff's real binary (~140 MB) **plus all of its
+state** — credentials, settings, history — into `~/.config/manicode`
+(the wrapper's configDir: always `$HOME/.config/manicode`; its
+`configDir` option is test-only and no environment variable overrides
+it). Sandboxes never download: step 6 execs this exact binary, and the
+launcher aborts up front if it is missing.
+
 ## 3. One-time shell setup (open a fresh shell; exports are per-shell)
 
 Run this once per terminal — it puts the repo's dev CLI on `PATH` and
@@ -143,8 +156,24 @@ on x86_64:
 | host | guest | mode | why |
 |---|---|---|---|
 | `/nix` | `/nix` | ro | every package and shared library, one physical copy (DAX-shared RAM too, via this fork) |
-| `/var/lib/fnm` | `/var/lib/fnm` | ro | your one node install carrying `freebuff`, `opencode`, `repomix` |
+| `/var/lib/fnm` | `/var/lib/fnm` | ro | your one node install (`node`/`npx` for the agent) |
 | `$PROJECTS_DIR` | `/workspace` | rw | the code Freebuff edits — your real uid (1000) in the guest |
+
+Because x86_64 allows exactly three mounts, Freebuff's own install does
+not get one. Instead the launcher hardlinks the host's
+`~/.config/manicode` (step 2's binary, credentials, settings, history)
+into the workspace share:
+
+```text
+$PROJECTS_DIR/.freebuff-home/.config/manicode   ← same inodes as ~/.config/manicode
+```
+
+and runs the guest with `HOME=/workspace/.freebuff-home`, so the native
+binary resolves its configDir through the mount. Hardlinks, not a
+symlink: they are plain directory entries inside the mounted subtree
+(no path outside the share has to resolve through virtiofs), and every
+staged file keeps one inode shared with the host. The farm is rebuilt
+from the host on every launch — the host dir is the source of truth.
 
 **First run:**
 
@@ -152,12 +181,18 @@ on x86_64:
    (no Docker involved) — plain outbound HTTPS to `nvcr.io` required;
 2. the VM boots (10–30 s);
 3. OpenShell's policy advisor asks you to **approve Freebuff's network
-   egress** (its self-updater downloads the native binary once, into the
-   sandbox's own overlay). Answer once; the allowlist sticks.
+   egress** (its API endpoints — Freebuff itself is never downloaded
+   inside the sandbox; the launcher verified the host binary up front
+   and aborts with instructions if it is missing). Answer once; the
+   allowlist sticks.
 
-Freebuff's login/history state lives in the sandbox's writable overlay
-(`overlay_disk_mib`), surviving stops and restarts of that sandbox — and
-deleted with `openshell sandbox delete`.
+Freebuff's login/history state **is your host's state**: the farm
+hardlinks every existing file of `~/.config/manicode`, so writes from
+the guest land on the host's real files — a `freebuff` on the host and
+one in a sandbox see the same credentials and history.
+`openshell sandbox delete` no longer touches freebuff state; remove
+`$PROJECTS_DIR/.freebuff-home` for that (it is rebuilt on the next
+launch anyway).
 
 ## 7. Everyday commands
 
@@ -176,7 +211,7 @@ Useful knobs (all environment variables on the launcher):
 | variable | default | meaning |
 |---|---|---|
 | `PROJECTS_DIR` | `~/Projects` | host directory mounted rw at `/workspace` |
-| `SANDBOX_NAME` | `freebuff` | sandbox name (recreate with a new name for a clean state) |
+| `SANDBOX_NAME` | `freebuff` | sandbox name (a new name gives you a clean sandbox; Freebuff's own state is the host's — see step 6) |
 | `SHARE_NIX_RW` | `0` | `1` mounts `/nix` **writable** — read the security note in [README.md](README.md) first |
 | `POLICY_FILE` | `sandbox-policy.yaml` next to the launcher | filesystem policy without which the mounts return `EACCES` |
 | `DRY_RUN` | `0` | `1` prints the exact `openshell sandbox create …` instead of running |
@@ -220,6 +255,14 @@ symlink) prints this reminder automatically when the pin goes stale.
 * **`cargo: command not found`** — you left the toolchain shell; re-enter
   `nix develop` (or your rustup environment).
 * **port 18081 already in use** — `OPENSHELL_SERVER_PORT=18082 ./tasks/scripts/gateway-vm.sh`.
+* **`no native freebuff binary at ~/.config/manicode/freebuff`** — run
+  `freebuff` once on the host (step 2); sandboxes never download it for
+  you.
+* **`Failed to download freebuff … EACCES`** — must not happen with the
+  current launcher (the guest execs the staged host binary directly,
+  never the npm wrapper). If you still see it, your `freebuff-sandbox`
+  copy predates the workspace-farm mechanism — update it, and do not
+  approve the download.
 * **Freebuff egress denied (`EACCES` on its endpoints)** — approve the
   endpoints in the policy advisor, or extend `sandbox-policy.yaml`; the
   sandbox is working as intended.
@@ -242,6 +285,7 @@ symlink) prints this reminder automatically when the pin goes stale.
 | driver state, image cache, overlays | `/tmp/openshell-vm-driver-$USER-vm-dev/` (switches to `~/.local/state` for the system install) |
 | registered gateways / active gateway | `~/.config/openshell/` |
 | VM runtime artifacts | `target/vm-runtime-compressed/` (inside the clone) |
+| freebuff binary + state (credentials, history) | `~/.config/manicode/` on the host, hardlinked into sandboxes via `$PROJECTS_DIR/.freebuff-home` |
 | built binaries | `target/debug/` (inside the clone) |
 
 Security decisions (read before weakening): the read-only `/nix`

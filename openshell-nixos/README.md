@@ -108,14 +108,19 @@ page-cache frames instead of copying them — measured at **0 kB** guest
 `Cached` growth on a126 MiB read (the pre-DAX control on this machine:
 +146168 kB, see "KSM reality check"). ksmd merges neither the host's
 file-backed cache nor libkrun's guest RAM, so it stays a secondary
-mechanism. Freebuff state (login, history)
-lives in the sandbox's writable overlay (`overlay_disk_mib`), not on the
-host.
+mechanism. Freebuff's binary and state (login, history) are not in the
+overlay either: the launcher hardlinks the host's `~/.config/manicode`
+into `$PROJECTS_DIR/.freebuff-home` and points the guest's `HOME` at it,
+so the guest execs the host's own binary and its state writes land on
+the host's real files — rebuilt from the host on every launch.
 
 First run: the driver pulls `nvcr.io/nvidia/base/ubuntu:24.04` by digest
 (no Docker needed), boots (10–30 s), and OpenShell will ask you to approve
 freebuff's network egress through its policy advisor — answer once for a
-production-worthy allowlist.
+production-worthy allowlist. Freebuff itself is never downloaded inside
+the sandbox: the launcher stages your host's `~/.config/manicode` into
+the workspace share (the hardlink farm above) and aborts up front, with
+instructions, if the host binary is missing.
 
 ## Security decisions (read before weakening)
 
@@ -134,7 +139,10 @@ production-worthy allowlist.
 * **The rw `/workspace` mount is the real trust boundary**: uid 1000 in
   the guest matches your uid, so the sandbox can rewrite your working
   trees (that is the point) — but not your home beyond it, not `/etc`,
-  not `/nix`.
+  not `/nix`. The `.freebuff-home` hardlink farm deliberately places
+  your freebuff state inside that boundary (sharing it is the point; it
+  is rebuilt from `~/.config/manicode` on every launch — remove the
+  folder to revoke it).
 * **The gateway is loopback-only** (`127.0.0.1:17670`, TLS with a
   locally generated CA) and runs as *your user*, not root.
 * **Guests have no network interface at all** — DNS/egress go through the
@@ -216,9 +224,15 @@ Checked here, before delivery:
   launcher now resolves the store's gcc-lib dir on the host (via nix-ld's
   symlink farm, so no store path is hard-coded) and exports it in the
   guest command; verified live (node runs, freebuff wrapper execs).
-* **freebuff itself launches** and reaches its self-updater, which stops
-  at OpenShell's egress policy (`EACCES` on `codebuff.com`) — the
-  documented first-run policy-advisor approval step, not a mount defect.
+* **freebuff itself launches — with zero downloads in the sandbox.**
+  Re-verified after the workspace-farm change: the guest execs the
+  host's own `~/.config/manicode/freebuff` (staged as hardlinks under
+  `$PROJECTS_DIR/.freebuff-home`, `HOME` redirected there), the TUI
+  renders with the host's project list, live-session markers appear
+  through shared inodes, `--version` exits 0 printing `0.2.34`, and the
+  log contains no `EACCES`/download attempt at all. Its API egress still
+  stops at OpenShell's policy until approved — the documented first-run
+  policy-advisor step, not a mount defect.
 
 **KSM reality check (measured on this machine, kernel 7.2.9):**
 

@@ -26,7 +26,9 @@ use crate::rootfs::{
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
     validate_host_supervisor, write_rootfs_image_file,
 };
-use crate::runtime::VmBackend;
+use crate::runtime::{
+    VmBackend, cloud_hypervisor_supervisor_socket, cloud_hypervisor_vsock_socket,
+};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
@@ -162,6 +164,11 @@ fn default_read_only() -> bool {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VmSandboxDriverConfig {
+    /// Per-sandbox VM backend override (`template.driver_config.vm.backend`).
+    /// `None` falls back to the driver-wide `default_vm_backend`, then to the
+    /// historical default (libkrun, or QEMU when a GPU reservation forces it).
+    #[serde(default)]
+    backend: Option<VmBackend>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_non_empty_string_list"
@@ -369,6 +376,11 @@ pub struct VmDriverConfig {
     /// their own store.
     #[serde(default)]
     pub guest_nix_cache: bool,
+    /// Driver-wide default VM backend for sandboxes that do not select one
+    /// via `template.driver_config.vm.backend`. `None` keeps the historical
+    /// default (libkrun, or QEMU when a GPU reservation forces it).
+    #[serde(default)]
+    pub default_vm_backend: Option<VmBackend>,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -436,6 +448,7 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
             .field("guest_nix_cache", &self.guest_nix_cache)
+            .field("default_vm_backend", &self.default_vm_backend)
             .finish()
     }
 }
@@ -480,6 +493,7 @@ impl Default for VmDriverConfig {
             rootfs_tar_max_bytes: None,
             enable_bind_mounts: false,
             guest_nix_cache: false,
+            default_vm_backend: None,
         }
     }
 }
@@ -1533,6 +1547,19 @@ impl VmDriver {
                 }
             };
 
+        // Backend selection: per-sandbox `driver_config.vm.backend` wins over
+        // the driver-wide default; the plan's own choice (libkrun, or QEMU
+        // when a GPU reservation forced it) is the fallback. Backends that
+        // speak vsock need a host CID the same way the QEMU path does.
+        if let Some(requested) = driver_config.backend.or(self.config.default_vm_backend)
+            && plan.backend != requested
+        {
+            plan.backend = requested;
+            if plan.vsock_cid.is_none() {
+                plan.vsock_cid = Some(allocate_vsock_cid());
+            }
+        }
+
         if let Err(err) = self
             .lifecycle_extensions
             .configure_launch(&sandbox, &state_dir, &mut plan)
@@ -1656,18 +1683,30 @@ impl VmDriver {
             server_name: channel_tls.server_name.clone(),
             trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
         };
-        let transport = if plan.backend == VmBackend::Qemu {
-            let guest_cid = plan
-                .vsock_cid
-                .ok_or_else(|| Status::internal("QEMU launch plan is missing a guest vsock CID"))?;
-            SandboxTransport::RuntimeInitiatedVsock {
-                guest_cid,
-                // Each QEMU guest connects to a distinct host port. The CID
-                // allocator already guarantees uniqueness among live guests.
-                port: VM_CONTROL_PORT
-                    .checked_add(guest_cid)
-                    .filter(|port| *port != u32::MAX)
-                    .ok_or_else(|| Status::resource_exhausted("VM control port space exhausted"))?,
+        let transport = if matches!(plan.backend, VmBackend::Qemu | VmBackend::CloudHypervisor) {
+            let guest_cid = plan.vsock_cid.ok_or_else(|| {
+                Status::internal("QEMU/Cloud-Hypervisor launch plan is missing a guest vsock CID")
+            })?;
+            if plan.backend == VmBackend::CloudHypervisor {
+                // cloud-hypervisor's vsock muxer never touches host AF_VSOCK:
+                // a guest-initiated dial connects to "<vsock.sock>_<port>" on
+                // the host, so the supervisor binds that unix socket while the
+                // guest config keeps dialing the ordinary control port.
+                SandboxTransport::RuntimeInitiatedUnix {
+                    socket_path: cloud_hypervisor_supervisor_socket(&state_dir, VM_CONTROL_PORT),
+                }
+            } else {
+                SandboxTransport::RuntimeInitiatedVsock {
+                    guest_cid,
+                    // Each QEMU guest connects to a distinct host port. The CID
+                    // allocator already guarantees uniqueness among live guests.
+                    port: VM_CONTROL_PORT
+                        .checked_add(guest_cid)
+                        .filter(|port| *port != u32::MAX)
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("VM control port space exhausted")
+                        })?,
+                }
             }
         } else {
             SandboxTransport::RuntimeInitiatedUnix {
@@ -1749,13 +1788,33 @@ impl VmDriver {
             command.arg("--vm-kernel-image").arg(kernel_image);
         }
 
-        if plan.backend == VmBackend::Qemu {
-            command.arg("--vm-backend").arg("qemu");
+        if matches!(plan.backend, VmBackend::Qemu | VmBackend::CloudHypervisor) {
+            command
+                .arg("--vm-backend")
+                .arg(if plan.backend == VmBackend::CloudHypervisor {
+                    "cloud-hypervisor"
+                } else {
+                    "qemu"
+                });
             if let Some(bdf) = plan.gpu_bdf.as_deref() {
                 command.arg("--vm-gpu-bdf").arg(bdf);
             }
             if let Some(vsock_cid) = plan.vsock_cid {
                 command.arg("--vm-vsock-cid").arg(vsock_cid.to_string());
+            }
+            if plan.backend == VmBackend::CloudHypervisor {
+                // The worker points cloud-hypervisor's muxer at this socket;
+                // the supervisor listens on `<socket>_<control port>`, the
+                // path the muxer dials for guest-initiated connections.
+                let vsock_socket = cloud_hypervisor_vsock_socket(&state_dir);
+                let _ = tokio::fs::remove_file(&vsock_socket).await;
+                command.arg("--vm-vsock-runtime-initiated");
+                command
+                    .arg("--vm-vsock-control-port")
+                    .arg(VM_CONTROL_PORT.to_string());
+                command
+                    .arg("--vm-vsock-control-socket")
+                    .arg(&vsock_socket);
             }
         } else {
             let _ = tokio::fs::remove_file(&control_socket).await;
@@ -2597,7 +2656,16 @@ impl VmDriver {
             plan.require_backend_feature(BackendFeature::GuestInitDropins);
         }
 
-        if plan.required_backends.contains(&VmBackend::Qemu)
+        if plan.backend == VmBackend::CloudHypervisor {
+            // An explicit Cloud-Hypervisor selection already provides PCI
+            // device assignment (`--device path=`) and external kernel boot
+            // (`--kernel`), so QEMU-mapped backend features are satisfied
+            // here. Extensions that *explicitly* require the QEMU backend
+            // stay conflicting and are rejected by validation below.
+            if plan.vsock_cid.is_none() {
+                plan.vsock_cid = Some(allocate_vsock_cid());
+            }
+        } else if plan.required_backends.contains(&VmBackend::Qemu)
             || plan.backend == VmBackend::Qemu
             || plan
                 .required_backend_features
@@ -2659,9 +2727,9 @@ impl VmDriver {
                  but non-GPU QEMU launch is not yet supported (pending PCI device transport)"
             )));
         }
-        if plan.backend != VmBackend::Qemu && is_gpu {
+        if !matches!(plan.backend, VmBackend::Qemu | VmBackend::CloudHypervisor) && is_gpu {
             return Err(Status::failed_precondition(
-                "GPU sandbox launch requires the QEMU backend",
+                "GPU sandbox launch requires the QEMU or Cloud-Hypervisor backend",
             ));
         }
         if plan.required_backends.contains(&VmBackend::Libkrun)
@@ -2683,7 +2751,7 @@ impl VmDriver {
                 "VM lifecycle extension requires the QEMU backend",
             ));
         }
-        if plan.backend != VmBackend::Qemu
+        if !matches!(plan.backend, VmBackend::Qemu | VmBackend::CloudHypervisor)
             && let Some(feature) = plan
                 .required_backend_features
                 .iter()
@@ -2694,7 +2762,9 @@ impl VmDriver {
                 feature.as_str()
             )));
         }
-        if plan.kernel_image.is_some() && plan.backend != VmBackend::Qemu {
+        if plan.kernel_image.is_some()
+            && !matches!(plan.backend, VmBackend::Qemu | VmBackend::CloudHypervisor)
+        {
             return Err(Status::failed_precondition(
                 "selected kernel image requires a VM backend that supports external kernel images",
             ));
@@ -13027,6 +13097,78 @@ while :; do sleep 0.05; done"#,
 
         assert_eq!(plan.backend, VmBackend::Qemu);
         assert!(plan.vsock_cid.is_some());
+    }
+
+    #[test]
+    fn cloud_hypervisor_selection_survives_resolution_and_validation() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-ch", false, false, None)
+            .expect("base plan should build");
+        plan.backend = VmBackend::CloudHypervisor;
+        plan.vsock_cid = Some(allocate_vsock_cid());
+        plan.require_backend_feature(BackendFeature::PciPassthrough);
+
+        driver
+            .resolve_launch_plan_backend("sandbox-ch", false, None, &mut plan)
+            .expect("cloud-hypervisor satisfies PCI-style backend features");
+
+        assert_eq!(plan.backend, VmBackend::CloudHypervisor);
+        assert!(plan.vsock_cid.is_some());
+        VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect("non-GPU cloud-hypervisor launch validates");
+    }
+
+    #[test]
+    fn explicit_qemu_requirement_conflicts_with_cloud_hypervisor_selection() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-ch-qemu", false, false, None)
+            .expect("base plan should build");
+        plan.backend = VmBackend::CloudHypervisor;
+        plan.vsock_cid = Some(allocate_vsock_cid());
+        plan.require_backend(VmBackend::Qemu);
+
+        driver
+            .resolve_launch_plan_backend("sandbox-ch-qemu", false, None, &mut plan)
+            .expect("resolution defers the conflict to validation");
+        assert_eq!(plan.backend, VmBackend::CloudHypervisor);
+
+        let err = VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect_err("explicit QEMU requirement must conflict with CH selection");
+        assert!(err.message().contains("requires the QEMU backend"));
+    }
+
+    #[test]
+    fn gpu_launch_validates_on_cloud_hypervisor_but_not_libkrun() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-gpu-ch", true, true, Some("0000:01:00.0".to_string()))
+            .expect("gpu plan should build");
+        assert_eq!(plan.backend, VmBackend::Qemu);
+
+        plan.backend = VmBackend::CloudHypervisor;
+        VmDriver::validate_launch_plan_backend(true, &plan)
+            .expect("GPU cloud-hypervisor launch validates");
+
+        plan.backend = VmBackend::Libkrun;
+        let err = VmDriver::validate_launch_plan_backend(true, &plan)
+            .expect_err("libkrun cannot back a GPU sandbox");
+        assert!(err.message().contains("QEMU or Cloud-Hypervisor"));
+    }
+
+    #[test]
+    fn sandbox_driver_config_parses_backend_override() {
+        let config: VmSandboxDriverConfig =
+            serde_json::from_value(serde_json::json!({ "backend": "cloud-hypervisor" }))
+                .expect("valid driver_config");
+        assert_eq!(config.backend, Some(VmBackend::CloudHypervisor));
+
+        let err = serde_json::from_value::<VmSandboxDriverConfig>(serde_json::json!({
+            "backend": "kvm"
+        }))
+        .expect_err("unknown backend must be rejected");
+        assert!(err.to_string().contains("cloud-hypervisor"));
     }
 
     #[test]

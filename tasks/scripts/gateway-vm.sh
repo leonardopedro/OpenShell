@@ -402,6 +402,23 @@ if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP+x}" ]]; then
   printf 'provider_spiffe_allow_guest_tcp = %s\n' "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP}" >>"${CONFIG_PATH}"
 fi
 
+# VM backend selection and per-sandbox driver_config/mount admission.
+# All opt-in: unset variables keep the historical defaults (libkrun backend,
+# driver_config rejected, no host bind mounts, resource admission on).
+#   OPENSHELL_VM_DEFAULT_BACKEND = libkrun | qemu | cloud-hypervisor
+if [[ -n "${OPENSHELL_VM_DEFAULT_BACKEND+x}" ]]; then
+  printf 'default_vm_backend = "%s"\n' "$(toml_escape "${OPENSHELL_VM_DEFAULT_BACKEND}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_ALLOW_DRIVER_CONFIG+x}" ]]; then
+  printf 'allow_driver_config = %s\n' "$(normalize_bool "${OPENSHELL_VM_ALLOW_DRIVER_CONFIG}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_ENABLE_BIND_MOUNTS+x}" ]]; then
+  printf 'enable_bind_mounts = %s\n' "$(normalize_bool "${OPENSHELL_VM_ENABLE_BIND_MOUNTS}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_RESOURCE_ADMISSION+x}" ]]; then
+  printf '\n[openshell.drivers.vm.resource_admission]\nenabled = %s\n' "$(normalize_bool "${OPENSHELL_VM_RESOURCE_ADMISSION}")" >>"${CONFIG_PATH}"
+fi
+
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
