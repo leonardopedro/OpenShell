@@ -227,7 +227,7 @@ fn cloud_hypervisor_tool_env(key: &str, default: &str) -> PathBuf {
 }
 
 /// Host-side unix socket cloud-hypervisor's vsock muxer binds (its
-/// host-initiated listener). The muxer has no host AF_VSOCK path: for a
+/// host-initiated listener). The muxer has no host `AF_VSOCK` path: for a
 /// guest-initiated dial to `port` it connects to `"<socket>_<port>"` — see
 /// [`cloud_hypervisor_supervisor_socket`], which the driver hands to the
 /// supervisor as its runtime-initiated listener.
@@ -250,19 +250,19 @@ pub fn cloud_hypervisor_supervisor_socket(state_dir: &Path, port: u32) -> PathBu
 /// config, dev-machine fallbacks, then a clear setup hint. CH detects the
 /// image format itself (bzImage or ELF vmlinux).
 fn resolve_cloud_hypervisor_kernel(config: &VmLaunchConfig) -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("OPENSHELL_VM_CH_KERNEL") {
-        if !explicit.is_empty() {
-            let path = PathBuf::from(&explicit);
-            if path.is_file() {
-                return Ok(path);
-            }
-            return Err(format!("OPENSHELL_VM_CH_KERNEL={explicit} is not a file"));
+    if let Ok(explicit) = std::env::var("OPENSHELL_VM_CH_KERNEL")
+        && !explicit.is_empty()
+    {
+        let path = PathBuf::from(&explicit);
+        if path.is_file() {
+            return Ok(path);
         }
+        return Err(format!("OPENSHELL_VM_CH_KERNEL={explicit} is not a file"));
     }
-    if let Some(kernel_image) = &config.kernel_image {
-        if kernel_image.is_file() {
-            return Ok(kernel_image.clone());
-        }
+    if let Some(kernel_image) = &config.kernel_image
+        && kernel_image.is_file()
+    {
+        return Ok(kernel_image.clone());
     }
     let cwd = std::env::current_dir().map_err(|err| format!("current_dir: {err}"))?;
     for candidate in CH_KERNEL_CANDIDATES {
@@ -350,11 +350,10 @@ fn run_cloud_hypervisor_vm(config: &VmLaunchConfig) -> Result<(), String> {
     // the suffixed sibling derived from it (driver side builds the same pair
     // via `cloud_hypervisor_supervisor_socket`). The libkrun port-map socket
     // carries the identical path when the driver provided one.
-    let vsock_socket = config
-        .vsock_port_map
-        .as_ref()
-        .map(|map| map.host_socket.clone())
-        .unwrap_or_else(|| cloud_hypervisor_vsock_socket(state_dir));
+    let vsock_socket = config.vsock_port_map.as_ref().map_or_else(
+        || cloud_hypervisor_vsock_socket(state_dir),
+        |map| map.host_socket.clone(),
+    );
 
     // One virtiofsd per share, tagged with the driver-generated `osfsN` tag
     // the guest mount manifest also uses. Each daemon dies with this launcher
@@ -436,8 +435,7 @@ fn run_cloud_hypervisor_vm(config: &VmLaunchConfig) -> Result<(), String> {
                         "tag={tag},socket={},num_queues=1,queue_size=1024",
                         socket.display()
                     )
-                })
-                .collect::<Vec<_>>(),
+                }),
         );
     }
     if let Some(gpu_bdf) = &config.gpu_bdf {
@@ -448,16 +446,16 @@ fn run_cloud_hypervisor_vm(config: &VmLaunchConfig) -> Result<(), String> {
     // the VFIO BDF above — CH accepts both device models. A vanished socket
     // degrades to a GPU-less boot (the spectrum launch script does the same)
     // so a crashed crosvm cannot brick every sandbox launch.
-    if let Ok(gpu_socket) = std::env::var("OPENSHELL_VM_CH_GPU_SOCKET") {
-        if !gpu_socket.is_empty() {
-            if Path::new(&gpu_socket).exists() {
-                ch_cmd.arg("--gpu").arg(format!("socket={gpu_socket}"));
-            } else {
-                eprintln!(
-                    "cloud-hypervisor: OPENSHELL_VM_CH_GPU_SOCKET={gpu_socket} is absent, \
-                     launching without vhost-user GPU"
-                );
-            }
+    if let Ok(gpu_socket) = std::env::var("OPENSHELL_VM_CH_GPU_SOCKET")
+        && !gpu_socket.is_empty()
+    {
+        if Path::new(&gpu_socket).exists() {
+            ch_cmd.arg("--gpu").arg(format!("socket={gpu_socket}"));
+        } else {
+            eprintln!(
+                "cloud-hypervisor: OPENSHELL_VM_CH_GPU_SOCKET={gpu_socket} is absent, \
+                 launching without vhost-user GPU"
+            );
         }
     }
     ch_cmd
