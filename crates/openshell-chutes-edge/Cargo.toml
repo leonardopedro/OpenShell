@@ -1,0 +1,28 @@
+[package]
+name = "openshell-chutes-edge"
+description = "Pingora frontend for the OpenShell Chutes E2EE proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-chutes-edge"
+path = "src/main.rs"
+
+[dependencies]
+openshell-server = { path = "../openshell-server" }
+openshell-crypto = { workspace = true, features = ["tls-kube", "tls-sqlx"] }
+
+async-trait = "0.1"
+bytes = { workspace = true }
+futures = { workspace = true }
+pingora = { version = "0.8.1", features = ["proxy"] }
+pingora-core = "0.8.1"
+pingora-http = "0.8.1"
+pingora-proxy = "0.8.1"
+reqwest = { workspace = true, features = ["stream"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

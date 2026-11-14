@@ -45,7 +45,7 @@ pub enum SseItem {
 
 /// Renders one item as a single SSE line (the following blank-line framing
 /// arrives separately as [`SseItem::Other`]).
-fn render(item: &SseItem) -> String {
+pub fn render(item: &SseItem) -> String {
     match item {
         SseItem::Other(line) => {
             if line.is_empty() {
@@ -60,7 +60,7 @@ fn render(item: &SseItem) -> String {
     }
 }
 
-fn error_event_line(message: &str) -> String {
+pub fn error_event_line(message: &str) -> String {
     let event = json!({"error": {"message": message, "type": "chutes_e2ee_proxy_error"}});
     format!("data: {event}\n\n")
 }
