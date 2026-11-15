@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# infinity-sandbox — run Infinity Code inside an OpenShell microVM on the
+# cloud-hypervisor backend, with Infinity "baked in" through the shared Nix
+# store instead of uploaded into a container.
+#
+#   ./infinity-sandbox                       # Infinity in $PROJECTS_DIR
+#   ./infinity-sandbox -- "explain this repo"
+#   PROJECTS_DIR=~/code SANDBOX_NAME=inf2 ./infinity-sandbox
+#   SANDBOX_GPU=1 ./infinity-sandbox         # model served from the host GPU
+#
+# GPU profile: the model keeps running on the gateway host (`edge0-infer
+# serve --device vulkan`), and the sandbox reaches it through the `edge0-gpu`
+# provider profile on port 8001. Nothing is passed through into the guest —
+# the OpenShell VM image has no NVIDIA userspace, so a VFIO card would be
+# visible but unusable, and one host-resident model serves every sandbox.
+# SANDBOX_GPU=1 only selects that profile, points the provider at :8001 and
+# runs host-side preflight checks (card visible, server on the Vulkan build,
+# endpoint answering). It does not touch the VM.
+#
+# Why this replaces `openshell sandbox upload`:
+#
+#   The fork's VM driver mounts the host's /nix read-only into the guest
+#   (VirtioFS + DAX), so a store path on the host is the *same path* in the
+#   guest. Adding the three binaries to the store with `nix store add-path`
+#   therefore installs them for every sandbox, at no per-sandbox cost and
+#   with no copy into the image: the guest execs /nix/store/…/bin/infinity
+#   straight out of the host's store. Upgrading Infinity is one `nix store
+#   add-path` of a new build; nothing is uploaded and no image is rebuilt.
+#
+#   Everything that is *not* the binary (providers.json, rap.json, sessions)
+#   lives in $PROJECTS_DIR/.infinity-home, staged from the host's ~/.infinity
+#   as a hardlink farm and pointed at by the guest's HOME — the same trick
+#   freebuff-sandbox uses for ~/.config/manicode, so state written in the
+#   sandbox lands on the host's real files.
+#
+# Two mounts (virtiofs shares of virtiofsd, provided by the fork's
+# cloud-hypervisor backend; x86_64 allows three):
+#   /nix          ro   host Nix store = guest store: Infinity's binaries and
+#                      every library they need, plus the guest tools
+#   $PROJECTS_DIR rw   /workspace: the code the agent edits — and
+#                      /workspace/.infinity-home, the guest's HOME.
+#
+# The backend is selected per sandbox in driver_config.vm.backend, so the
+# gateway's default (libkrun) stays untouched. cloud-hypervisor needs a guest
+# kernel and the patched binary; see the checked env vars below and README.md.
+set -euo pipefail
+
+die() { printf 'infinity-sandbox: %s\n' "$*" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  command -v openshell >/dev/null 2>&1 || die "openshell CLI not on PATH (from the clone root: export PATH=\"\$PWD/scripts/bin:\$PATH\" — see the tutorial — or run ./install.sh for a system install)"
+fi
+command -v nix >/dev/null 2>&1 || die "nix not on PATH — the guest gets Infinity through the shared store, so the binaries must be store paths"
+
+# The Infinity build: three bins, built on the host. `cargo build --release`
+# in the Infinity checkout produces them here; point INFINITY_BIN_DIR at
+# target/debug for a debug build.
+INFINITY_BIN_DIR="${INFINITY_BIN_DIR:-$SCRIPT_DIR/../../infinity/target/release}"
+[[ -d "$INFINITY_BIN_DIR" ]] || die "no build directory at $INFINITY_BIN_DIR (run 'cargo build --release' in ../infinity, or set INFINITY_BIN_DIR)"
+for bin in infinity infinity-provider-openai sandbox-local; do
+  [[ -x "$INFINITY_BIN_DIR/$bin" ]] || die "$INFINITY_BIN_DIR/$bin is missing or not executable (build it: cargo build --release -p infinity-agent-cli -p infinity-provider-openai -p sandbox-local)"
+done
+
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
+SANDBOX_NAME="${SANDBOX_NAME:-infinity}"
+# 1 = the model is served by the host's GPU (Vulkan) on EDGE0_GPU_PORT and the
+# sandbox uses the `edge0-gpu` provider profile; 0 = whatever profile/endpoint
+# you name. See the GPU profile note at the top of this file.
+SANDBOX_GPU="${SANDBOX_GPU:-0}"
+EDGE0_GPU_PORT="${EDGE0_GPU_PORT:-8001}"
+# Provider instance to attach (from `openshell provider create --name edge0
+# --type edge0-openai`); empty means none, and egress to the model server
+# stays denied by policy.
+if [[ "$SANDBOX_GPU" == 1 ]]; then
+  SANDBOX_PROVIDER="${SANDBOX_PROVIDER-edge0-gpu}"
+  EDGE0_BASE_URL="${EDGE0_BASE_URL:-http://host.openshell.internal:$EDGE0_GPU_PORT/v1}"
+else
+  SANDBOX_PROVIDER="${SANDBOX_PROVIDER-edge0}"
+  EDGE0_BASE_URL="${EDGE0_BASE_URL:-http://host.openshell.internal:8000/v1}"
+fi
+EDGE0_MODEL="${EDGE0_MODEL:-edge0_35b}"
+EDGE0_CONTEXT_WINDOW="${EDGE0_CONTEXT_WINDOW:-16384}"
+EDGE0_API_KEY_FILE="${EDGE0_API_KEY_FILE:-$HOME/.edge0/api-key}"
+INFINITY_HOME_HOST="$PROJECTS_DIR/.infinity-home"
+# Extra guest tools from nixpkgs, made visible through the same /nix mount.
+# Infinity's search tool wants ripgrep; its sandbox tools want git or jj.
+# Override with INFINITY_TOOLS="" to rely on what the sandbox image has.
+INFINITY_TOOLS="${INFINITY_TOOLS-ripgrep git}"
+
+[[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
+
+# ── GPU preflight ─────────────────────────────────────────────────────────
+# These are host-side sanity checks only: the GPU never enters the guest, so a
+# failure here is a warning (the sandbox still boots and simply gets no model
+# answers), not a hard error.
+if [[ "$SANDBOX_GPU" == 1 ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_line="$(nvidia-smi --query-gpu=name,memory.total,memory.used \
+      --format=csv,noheader 2>/dev/null | head -1)"
+    if [[ -n "$gpu_line" ]]; then
+      printf 'infinity-sandbox: host GPU: %s (16K context needs ~5 GiB free)\n' "$gpu_line" >&2
+    else
+      printf 'infinity-sandbox: warning: nvidia-smi lists no GPU — the GPU model server will fail to start\n' >&2
+    fi
+  else
+    printf 'infinity-sandbox: warning: nvidia-smi not found; cannot confirm the host GPU is usable\n' >&2
+  fi
+  if pgrep -f 'edge0-infer serve' >/dev/null 2>&1; then
+    if pgrep -af 'edge0-infer serve' | grep -q -- '--device vulkan'; then
+      printf 'infinity-sandbox: edge0-infer is serving on vulkan\n' >&2
+    else
+      printf 'infinity-sandbox: warning: edge0-infer is running without --device vulkan (CPU build?) — the edge0-gpu profile expects the GPU server on :%s\n' "$EDGE0_GPU_PORT" >&2
+    fi
+  else
+    printf 'infinity-sandbox: warning: no edge0-infer serve process found; start it on 0.0.0.0:%s (see infinity-sandbox.md)\n' "$EDGE0_GPU_PORT" >&2
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    if curl -sf --max-time 2 -o /dev/null \
+      -H "Authorization: Bearer ${INFINITY_OPENAI_API_KEY:-$(cat "$EDGE0_API_KEY_FILE" 2>/dev/null)}" \
+      "http://127.0.0.1:$EDGE0_GPU_PORT/v1/models"; then
+      printf 'infinity-sandbox: GPU endpoint http://127.0.0.1:%s/v1 answers\n' "$EDGE0_GPU_PORT" >&2
+    else
+      printf 'infinity-sandbox: warning: http://127.0.0.1:%s/v1/models did not answer; the sandbox will start but model calls will fail\n' "$EDGE0_GPU_PORT" >&2
+    fi
+  fi
+fi
+
+# ── Bake Infinity into the store ──────────────────────────────────────────
+# Copy just the three binaries (not the multi-GB build directory) into a
+# temporary tree and add that tree to the store. A path already in the store
+# is returned as-is, so reruns after an unchanged build are free.
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/infinity-stage.XXXXXX")"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+# The directory *name* becomes the store path's name, so the provider profile
+# can authorize it with one glob: /nix/store/*-infinity/bin/…
+mkdir -p "$STAGE_DIR/infinity/bin"
+for bin in infinity infinity-provider-openai sandbox-local; do
+  cp "$INFINITY_BIN_DIR/$bin" "$STAGE_DIR/infinity/bin/$bin"
+done
+chmod 0755 "$STAGE_DIR/infinity/bin/"*
+INFINITY_STORE="$(nix store add-path "$STAGE_DIR/infinity")" || die "nix store add-path failed"
+[[ -x "$INFINITY_STORE/bin/infinity" ]] || die "store path $INFINITY_STORE lacks bin/infinity"
+echo "infinity-sandbox: Infinity baked at $INFINITY_STORE (shared into the guest via /nix)" >&2
+
+# ── Guest tools ───────────────────────────────────────────────────────────
+# Only the *closures* land in the store; like Infinity they reach the guest
+# through /nix, so no extra mount is spent on them (x86_64 allows three).
+TOOL_PATH=""
+if [[ -n "$INFINITY_TOOLS" ]]; then
+  # shellcheck disable=SC2086,SC2046 # deliberate word splitting of the attr list
+  TOOL_PATHS="$(nix build --no-link --print-out-paths --inputs-from "$SCRIPT_DIR" \
+    $(for tool in $INFINITY_TOOLS; do printf 'nixpkgs#%s ' "$tool"; done))" ||
+    die "failed to build guest tools: $INFINITY_TOOLS"
+  TOOL_PATH="$(printf '%s/bin:' $TOOL_PATHS)${TOOL_PATH}"
+fi
+
+# Host-built glibc binaries may link libraries out of the store (z3, gcc-lib,
+# …). The store is mounted at the same path in the guest, so pointing the
+# loader at those directories is enough; without this the guest dies with
+# "libz3.so: cannot open shared object file".
+STORE_LIBS="$(ldd "$INFINITY_BIN_DIR/infinity" 2>/dev/null |
+  awk '/=> \/nix\/store/ {print $3}' | xargs -r -n1 dirname 2>/dev/null |
+  sort -u | paste -sd: -)"
+LD_LIBRARY_PATH_VALUE="${STORE_LIBS:-/usr/lib/x86_64-linux-gnu}"
+
+# ── Stage Infinity's state into the workspace mount ───────────────────────
+# $HOME inside the guest points here, so ~/.infinity resolves through the
+# /workspace share onto these hardlinks: session history survives the sandbox
+# and the host's real files are updated in place. Config files are rewritten
+# every launch because they encode guest-only paths and the endpoint the
+# sandbox can reach — the host's own providers.json stays untouched.
+if [[ -e "$INFINITY_HOME_HOST" && ! -f "$INFINITY_HOME_HOST/.infinity-sandbox-host" ]]; then
+  die "$INFINITY_HOME_HOST exists but was not created by this launcher — remove it (or move it aside) and retry"
+fi
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  rm -rf "$INFINITY_HOME_HOST"
+  mkdir -p "$INFINITY_HOME_HOST/.infinity" || die "cannot create $INFINITY_HOME_HOST (is PROJECTS_DIR writable?)"
+  if [[ -d "$HOME/.infinity" ]]; then
+    # History and anything else the user keeps there; config is overwritten below.
+    cp -al "$HOME/.infinity/." "$INFINITY_HOME_HOST/.infinity/" 2>/dev/null ||
+      cp -a "$HOME/.infinity/." "$INFINITY_HOME_HOST/.infinity/" ||
+      die "cannot stage $HOME/.infinity into $INFINITY_HOME_HOST"
+  fi
+  cat > "$INFINITY_HOME_HOST/.infinity/providers.json" <<EOF
+{
+  "edge0": {
+    "command": [
+      "$INFINITY_STORE/bin/infinity-provider-openai",
+      "--base-url", "$EDGE0_BASE_URL",
+      "--model", "$EDGE0_MODEL",
+      "--context-window", "$EDGE0_CONTEXT_WINDOW"
+    ]
+  }
+}
+EOF
+  # OpenShell already isolates the guest: sandbox-local's own Bubblewrap layer
+  # cannot nest inside the supervisor, so it runs with --enable-sandbox=false.
+  cat > "$INFINITY_HOME_HOST/.infinity/rap.json" <<EOF
+{
+  "tool_sets": [
+    {
+      "type": "toolset_command",
+      "id": "sandbox-local",
+      "command": "$INFINITY_STORE/bin/sandbox-local --enable-sandbox=false"
+    }
+  ]
+}
+EOF
+  : > "$INFINITY_HOME_HOST/.infinity-sandbox-host"
+fi
+
+# ── Token ─────────────────────────────────────────────────────────────────
+# edge0-infer refuses non-loopback listeners without a key; the sandbox only
+# reaches it as host.openshell.internal. Passed with --env-from (not --env) so
+# the token never appears in this process's command line.
+if [[ -f "$EDGE0_API_KEY_FILE" ]]; then
+  INFINITY_OPENAI_API_KEY="$(cat "$EDGE0_API_KEY_FILE")"
+fi
+# Exported because --env-from copies the value from this process's environment.
+export INFINITY_OPENAI_API_KEY="${INFINITY_OPENAI_API_KEY:-}"
+ENV_ARGS=()
+# Loopback servers accept any non-empty key; a blank one is rejected outright.
+[[ -n "$INFINITY_OPENAI_API_KEY" ]] && ENV_ARGS+=(--env-from INFINITY_OPENAI_API_KEY)
+[[ -n "$SANDBOX_PROVIDER" ]] && ENV_ARGS+=(--provider "$SANDBOX_PROVIDER")
+
+# ── cloud-hypervisor requirements ─────────────────────────────────────────
+# The driver resolves the VMM from OPENSHELL_VM_CH_PATH and the guest kernel
+# from OPENSHELL_VM_CH_KERNEL (or ../cloud-hypervisor-build/workloads/…). Both
+# are read by the *gateway/driver* process, so they must be in its
+# environment, not just this shell's: a user unit picks them up from
+# ~/.config/systemd/user/openshell-gateway.service.
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  [[ -n "${OPENSHELL_VM_CH_PATH:-}" ]] || printf 'infinity-sandbox: warning: OPENSHELL_VM_CH_PATH is unset — the driver expects cloud-hypervisor on PATH (set it in the gateway unit to use the fork-built binary)\n' >&2
+  [[ -n "${OPENSHELL_VM_CH_KERNEL:-}" ]] || printf 'infinity-sandbox: warning: OPENSHELL_VM_CH_KERNEL is unset — falling back to ../cloud-hypervisor-build/workloads/vmlinux-x86_64 (see README.md for the download)\n' >&2
+fi
+
+# ── Assemble the sandbox ──────────────────────────────────────────────────
+# Paths go into JSON unescaped; refuse anything that would break it.
+for p in "$PROJECTS_DIR" "$INFINITY_STORE" "$TOOL_PATH" "$LD_LIBRARY_PATH_VALUE"; do
+  [[ "$p" != *\"* && "$p" != *\\* ]] || die "path contains a quote/backslash, refusing to build JSON: $p"
+done
+
+# Three mounts; cloud-hypervisor (unlike QEMU) accepts virtiofs mounts.
+MOUNTS="[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},"
+MOUNTS+="{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}]"
+DRIVER_CONFIG="{\"vm\":{\"backend\":\"cloud-hypervisor\",\"mounts\":$MOUNTS}}"
+
+# The guest shell: store binaries + nixpkgs tools on PATH, loader search path
+# for anything Infinity links out of the store, HOME through the workspace
+# mount, then exec Infinity with all arguments intact.
+GUEST_CMD="export PATH=$INFINITY_STORE/bin:${TOOL_PATH}\$PATH; export LD_LIBRARY_PATH=$LD_LIBRARY_PATH_VALUE:\${LD_LIBRARY_PATH:-}; export HOME=/workspace/.infinity-home; cd /workspace 2>/dev/null || cd /; exec $INFINITY_STORE/bin/infinity \"\$@\""
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q %s \\\n  -- sh -c %q sh %s\n' \
+    "$SANDBOX_NAME" "$DRIVER_CONFIG" "$SCRIPT_DIR/sandbox-policy.yaml" \
+    "${ENV_ARGS[*]:-}" "$GUEST_CMD" "$*"
+  exit 0
+fi
+
+exec openshell sandbox create --name "$SANDBOX_NAME" \
+  --driver-config-json "$DRIVER_CONFIG" \
+  --policy "$SCRIPT_DIR/sandbox-policy.yaml" \
+  "${ENV_ARGS[@]}" \
+  -- sh -c "$GUEST_CMD" sh "$@"

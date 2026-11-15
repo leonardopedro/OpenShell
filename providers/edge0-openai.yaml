@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/edge0-openai.yaml
+#   openshell provider profile import -f providers/edge0-openai.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   infinity-provider-openai (the Infinity provider process
+#                    that calls the model server) and curl for smoke tests.
+# Reference layout:  /sandbox/.local/bin (where the Infinity docs upload the
+#                    binary), /root/.cargo/bin or ~/.cargo/bin from a cargo
+#                    install. Add the path your image uses.
+# Credential scope:  none. The Edge0 server is credentialed with a local token,
+#                    passed to the workload as INFINITY_OPENAI_API_KEY via
+#                    `sandbox create --env` (or `--env-from`).
+# Endpoint access:   the Edge0 `edge0-infer serve` OpenAI-compatible API on the
+#                    gateway host, port 8000, read-write.
+# Smoke test:        openshell sandbox create --provider <name> -- \\
+#                      curl -sS http://host.openshell.internal:8000/v1/models
+#
+# Start the model server on the gateway host with a non-loopback listener so
+# the sandbox can reach it:
+#   edge0-infer serve --model "$MOE_ASSETS_35B" --device cpu \\
+#     --host 0.0.0.0 --port 8000 --api-key-file ~/.edge0/api-key
+# A non-loopback listener requires --api-key-file; clients must send its token.
+
+id: edge0-openai
+display_name: Edge0 (local OpenAI-compatible)
+description: Host-local Edge0 edge0-infer OpenAI Chat Completions API
+category: inference
+inference_capable: true
+credentials: []
+endpoints:
+  - host: host.openshell.internal
+    port: 8000
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  # openshell-nixos/infinity-sandbox: the binary is a host Nix store path
+  # (content-addressed, so the hash is matched, not spelled out).
+  - /nix/store/*-infinity/bin/infinity-provider-openai
+  - /sandbox/.local/bin/infinity-provider-openai
+  - /usr/local/bin/infinity-provider-openai
+  - /sandbox/.cargo/bin/infinity-provider-openai
+  - /root/.cargo/bin/infinity-provider-openai
+  - /usr/bin/curl
+  - /usr/local/bin/curl
