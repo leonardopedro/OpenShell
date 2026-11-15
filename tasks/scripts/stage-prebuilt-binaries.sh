@@ -12,7 +12,7 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/build-env.sh"
 
 usage() {
-  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|all>" >&2
+  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|chutes-edge|all>" >&2
 }
 
 normalize_arch() {
@@ -93,8 +93,11 @@ components_for_target() {
     supervisor|supervisor-output)
       echo "supervisor"
       ;;
+    chutes-edge)
+      echo "chutes-edge"
+      ;;
     all)
-      echo "gateway sandbox supervisor"
+      echo "gateway sandbox supervisor chutes-edge"
       ;;
     *)
       usage
@@ -118,6 +121,11 @@ resolve_component() {
     supervisor)
       crate=openshell-supervisor
       binary=openshell-supervisor
+      target_libc=gnu
+      ;;
+    chutes-edge)
+      crate=openshell-chutes-edge
+      binary=openshell-chutes-edge
       target_libc=gnu
       ;;
     *)
@@ -167,7 +175,8 @@ build_component_for_arch() {
   target="$(target_triple "$arch" "$target_libc")"
   stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-}"
-  if [[ "$component" == "gateway" ]]; then
+  if [[ "$component" == "gateway" || "$component" == "chutes-edge" ]]; then
+    # Both link the policy prover, so z3 must come from the build, not the host.
     features="${features} vendored-z3"
   fi
   current_host_os="$(host_os)"

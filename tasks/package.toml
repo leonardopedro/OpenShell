@@ -23,3 +23,7 @@ hide = true
 ["package:deb:install"]
 description = "Build OpenShell from source and install the deb locally (requires sudo)"
 run = "tasks/scripts/package-deb-install.sh"
+
+["package:verify"]
+description = "Build the deb and rpm in containers and verify their payloads (needs podman or docker)"
+run = "tasks/scripts/verify-packages.sh"

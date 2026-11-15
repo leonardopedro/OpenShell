@@ -172,6 +172,12 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+`OpenShell / Packaging Verify` is one of those contexts. It builds the deb and
+the gateway RPM inside their distribution containers and fails when either
+payload stops containing the files the repository installs, so a packaging
+change cannot merge with a missing binary or unit file. Run the same check
+locally with `mise run package:verify`.
+
 ### K3s conformance version baseline
 
 The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the

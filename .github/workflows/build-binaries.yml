@@ -98,6 +98,22 @@ jobs:
     timeout-minutes: 60
     steps: *build_steps
 
+  chutes-edge:
+    name: openshell-chutes-edge (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-chutes-edge
+      BINARY: openshell-chutes-edge
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
   runtimes:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
     env:

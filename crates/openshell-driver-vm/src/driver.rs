@@ -7809,7 +7809,7 @@ fn isolate_host_control_environment(command: &mut Command) {
 fn spawn_vm_launcher(
     command: &mut Command,
     sandbox_id: &str,
-    backend: &VmBackend,
+    backend: VmBackend,
 ) -> Result<Child, std::io::Error> {
     openshell_otel::record_error_result(command.spawn())
 }
@@ -8985,7 +8985,7 @@ mod tests {
         let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
 
         let result =
-            async { spawn_vm_launcher(&mut command, "sb-launch-trace", &VmBackend::Libkrun) }
+            async { spawn_vm_launcher(&mut command, "sb-launch-trace", VmBackend::Libkrun) }
                 .instrument(provisioning)
                 .await;
         assert!(result.is_err(), "the nonexistent launcher should fail");

@@ -9,6 +9,7 @@ depends = [
   "build:docker:gateway",
   "build:docker:sandbox",
   "build:docker:supervisor",
+  "build:docker:chutes-edge",
 ]
 hide = true
 
@@ -35,6 +36,11 @@ hide = true
 ["build:docker:supervisor"]
 description = "Build the supervisor image"
 run = "tasks/scripts/docker-build-image.sh supervisor"
+hide = true
+
+["build:docker:chutes-edge"]
+description = "Build the Chutes E2EE edge image"
+run = "tasks/scripts/docker-build-image.sh chutes-edge"
 hide = true
 
 ["docker:build:gateway"]

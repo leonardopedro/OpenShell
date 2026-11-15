@@ -117,6 +117,60 @@ To keep the gateway running after you log out, enable linger:
 sudo loginctl enable-linger $USER
 ```
 
+### Chutes edge
+
+Both packages also install `openshell-chutes-edge`, which terminates Chutes
+end-to-end encryption in front of the gateway. Unlike the gateway it runs as a
+system service (`openshell-chutes-edge.service`), because it serves one shared
+upstream key instead of a single user's containers. The package installs the
+unit but does not create its key file or start the service.
+
+Write the key file first. It is read as a systemd `EnvironmentFile`, so use
+`KEY=value` lines:
+
+```shell
+sudo install -d -m 0755 /etc/openshell
+sudo sh -c 'umask 077 && : >/etc/openshell/chutes-edge.env'
+sudoedit /etc/openshell/chutes-edge.env
+```
+
+At minimum:
+
+```shell
+CHUTES_API_KEY=<your-chutes-api-key>
+```
+
+These optional variables change its behavior: `CHUTES_EDGE_LISTEN` (default
+`127.0.0.1:8090`; set it to `0.0.0.0:8090` only if the edge must accept traffic
+from other hosts), `CHUTES_API_BASE`, `CHUTES_LLM_BASE`, `CHUTES_E2E_INVOKE`,
+`CHUTES_TIMEOUT_SECS`, `CHUTES_TLS_SPKI_PINS`, and `CHUTES_PROXY`.
+
+Keep the file `0600` and root-owned. systemd reads environment files itself, so
+the service's ephemeral user never opens this file and does not need access to
+it:
+
+```shell
+sudo chown root:root /etc/openshell/chutes-edge.env
+sudo chmod 0600 /etc/openshell/chutes-edge.env
+sudo systemctl enable --now openshell-chutes-edge
+systemctl status openshell-chutes-edge
+journalctl -u openshell-chutes-edge -f
+```
+
+Restart the service after editing the file:
+
+```shell
+sudo systemctl restart openshell-chutes-edge
+```
+
+Requests use the same Chutes routes as the gateway, prefixed with `/v1/chutes`.
+With the default listen address, confirm the edge can reach Chutes:
+
+```shell
+curl -sS http://127.0.0.1:8090/v1/chutes/models \
+  -H "Authorization: Bearer $CHUTES_API_KEY"
+```
+
 ## Snap
 
 The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.

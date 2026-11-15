@@ -24,6 +24,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use super::ChutesConfig;
+use super::ProxyPolicy;
 use super::e2ee::{self, E2eeSession};
 
 /// One discoverable chute instance.
@@ -92,18 +93,52 @@ pub struct ChutesClient {
     model_cache: Mutex<HashMap<String, String>>,
 }
 
+/// Reject endpoints that would put the API key or the E2EE handshake on a
+/// cleartext, off-host hop. Loopback `http` is allowed so tests and local
+/// upstreams do not need TLS.
+fn secure_endpoint(name: &str, raw: &str) -> String {
+    let url = url::Url::parse(raw)
+        .unwrap_or_else(|error| panic!("{name} is not a valid URL ({raw}): {error}"));
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| host == "localhost" || host == "::1" || host.starts_with("127."));
+    match url.scheme() {
+        "https" => raw.to_string(),
+        "http" if loopback => raw.to_string(),
+        scheme => panic!("{name} must use https (or http on loopback), got {scheme}: {raw}"),
+    }
+}
+
 impl ChutesClient {
     pub fn new(config: &ChutesConfig) -> Self {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .connect_timeout(Duration::from_secs(10))
+            // Never follow a redirect: a 30x from the API host could move the
+            // bearer token, and the E2EE handshake body is bound to one host.
+            .redirect(reqwest::redirect::Policy::none());
+        builder = match &config.proxy {
+            // Explicitly ignore HTTP(S)_PROXY: a proxy the operator did not
+            // choose should not sit in the "end-to-end" path.
+            ProxyPolicy::None => builder.no_proxy(),
+            ProxyPolicy::Environment => builder,
+            ProxyPolicy::Url(url) => builder.proxy(reqwest::Proxy::all(url).unwrap_or_else(
+                |error| panic!("CHUTES_PROXY is not a valid proxy URL ({url}): {error}"),
+            )),
+        };
+        if !config.tls_spki_pins.is_empty() {
+            let tls = super::tls::pinned_client_config(&config.tls_spki_pins)
+                .unwrap_or_else(|error| panic!("failed to build pinned chutes tls config: {error}"));
+            builder = builder.use_preconfigured_tls(tls);
+        }
+        let http = builder
             .build()
             .expect("failed to build chutes http client");
         Self {
             http,
-            api_base: config.api_base.clone(),
-            llm_base: config.llm_base.clone(),
-            e2e_invoke: config.e2e_invoke.clone(),
+            api_base: secure_endpoint("CHUTES_API_BASE", &config.api_base),
+            llm_base: secure_endpoint("CHUTES_LLM_BASE", &config.llm_base),
+            e2e_invoke: secure_endpoint("CHUTES_E2E_INVOKE", &config.e2e_invoke),
             model_cache: Mutex::new(HashMap::new()),
         }
     }

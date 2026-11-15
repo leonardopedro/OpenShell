@@ -19,9 +19,10 @@
 #
 # What it does, in order:
 #   1. preflight   — root/NixOS/KVM/e2fsprogs checks
-#   2. module      — render /etc/nixos/openshell.nix from this folder's
-#                    nixos-module.nix template (locked getFlake ref to the
-#                    package, @USER@, KSM on/off, kvm group). Rewritten
+#   2. module      — copy this folder's openshell-package.nix (the
+#                    derivation — no flake ref, no narHash pin) and render
+#                    /etc/nixos/openshell.nix from the nixos-module.nix
+#                    template (@USER@, KSM on/off, kvm group). Rewritten
 #                    only when the rendered result differs and the file
 #                    still carries the managed-by marker
 #   3. wire        — add './openshell.nix' to the system flake's modules
@@ -29,8 +30,9 @@
 #                    convention; --no-wire skips, for reruns after the
 #                    first wiring)
 #   4. switch      — `nixos-rebuild switch --flake /etc/nixos` (the package
-#                    ref is content-locked inline via its narHash —
-#                    flake.lock is not touched)
+#                    builds from the copied ./openshell-package.nix against
+#                    the system flake's own nixpkgs — flake.lock is not
+#                    touched)
 #   5. profile     — drop the leftover `nix profile` entry from the old
 #                    recipe if one exists (the system profile now owns it)
 #   6. gateway.toml— render ~/.config/openshell/gateway.toml (kept if
@@ -147,25 +149,20 @@ done
 # ------------------------------------------------------------- system module
 log "system module: $MODULE"
 
-# Locked reference to this folder as a flake: path + content hash. The
-# module's builtins.getFlake() pulls exactly this build from the store.
-if [[ $DRY_RUN -eq 1 ]]; then
-  OS_REF="path:$SCRIPT_DIR?narHash=sha256-<nix-flake-prefetch>"
-else
-  # Explicit path: so the hash matches builtins.getFlake "path:..." below.
-  # With a bare directory nix would auto-detect this folder's embedded .git
-  # and hash GIT-style (tracked files only) while getFlake uses the PATH
-  # fetcher (whole directory) — mismatched hashes fail the rebuild.
-  NARHASH="$(nix flake prefetch "path:$SCRIPT_DIR" --json | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')"
-  [[ -n "$NARHASH" ]] || die "nix flake prefetch $SCRIPT_DIR returned no hash"
-  OS_REF="path:$SCRIPT_DIR?narHash=$NARHASH"
-fi
+# The package is a plain file, not a locked flake ref: install.sh copies
+# this folder's openshell-package.nix next to the module, which
+# callPackages it. (The old mechanism pinned this folder as
+# builtins.getFlake "path:...?narHash=..." — every folder edit staled the
+# pin and the NEXT nixos-rebuild died at eval with a NAR hash mismatch;
+# update-nixos.sh existed only to re-sync it. Both are gone.)
+PKG_SRC="$SCRIPT_DIR/openshell-package.nix"
+PKG_DEST=/etc/nixos/openshell-package.nix
+[[ -f "$PKG_SRC" ]] || die "missing $PKG_SRC"
 
 if [[ $ENABLE_KSM -eq 1 ]]; then KSM_VAL=true; else KSM_VAL=false; fi
 
 render_module() {  # template -> stdout, machine values substituted
   local sed_args=(
-    -e "s|@OPENSHELL_REF@|$OS_REF|g"
     -e "s|@USER@|$REAL_USER|g"
     -e "s|@KSM_ENABLED@|$KSM_VAL|g"
   )
@@ -176,7 +173,16 @@ render_module() {  # template -> stdout, machine values substituted
 }
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  run "render nixos-module.nix -> $MODULE (openshell ref, user=$REAL_USER, ksm=$KSM_VAL)"
+  run "install $PKG_SRC -> $PKG_DEST"
+elif [[ -e "$PKG_DEST" ]] && cmp -s "$PKG_SRC" "$PKG_DEST"; then
+  info "package file unchanged ($PKG_DEST)"
+else
+  install -o root -g root -m 644 "$PKG_SRC" "$PKG_DEST"
+  info "written: $PKG_DEST (the module callPackages it — no flake ref)"
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  run "render nixos-module.nix -> $MODULE (user=$REAL_USER, ksm=$KSM_VAL)"
 elif [[ -e "$MODULE" ]] && ! grep -q '^# managed-by: openshell-nixos' "$MODULE"; then
   info "exists without the managed-by marker — hand-managed, leaving it untouched"
 elif [[ -e "$MODULE" ]] && render_module | cmp -s - "$MODULE"; then
@@ -193,19 +199,20 @@ fi
 # worktree — a file git does not know about is invisible to nixos-rebuild
 # (this repo's own .gitignore header documents that rule).
 if [[ $DRY_RUN -eq 1 ]]; then
-  run "git -C /etc/nixos add openshell.nix   (only if untracked)"
-elif [[ ! -e "$MODULE" ]]; then
-  :
+  run "git -C /etc/nixos add openshell.nix openshell-package.nix   (only if untracked)"
 elif [[ ! -d /etc/nixos/.git ]]; then
   info "/etc/nixos is not a git worktree — the module is visible as-is"
-elif git -C /etc/nixos ls-files --error-unmatch -- openshell.nix >/dev/null 2>&1; then
-  info "git: openshell.nix already tracked"
 else
-  if git -C /etc/nixos add -- openshell.nix; then
-    info "git: added openshell.nix (untracked files are invisible to flake eval)"
-  else
-    warn "could not 'git add' — if the rebuild reports openshell.nix missing, run: git -C /etc/nixos add openshell.nix"
-  fi
+  for f in openshell.nix openshell-package.nix; do
+    [[ -e "/etc/nixos/$f" ]] || continue
+    if git -C /etc/nixos ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+      info "git: $f already tracked"
+    elif git -C /etc/nixos add -- "$f"; then
+      info "git: added $f (untracked files are invisible to flake eval)"
+    else
+      warn "could not 'git add' $f — if the rebuild reports it missing, run: git -C /etc/nixos add $f"
+    fi
+  done
 fi
 
 # ----------------------------------------------------------------- wire module
@@ -235,7 +242,7 @@ fi
 log "switch: nixos-rebuild switch --flake /etc/nixos"
 
 info "builds into one new system generation: openshell package, ksm-sharing unit,"
-info "kvm group membership, linger — the getFlake ref is content-locked inline; flake.lock is untouched"
+info "kvm group membership, linger — the package builds from ./openshell-package.nix; flake.lock is untouched"
 run nixos-rebuild switch --flake /etc/nixos ||
   die "nixos-rebuild failed — nothing after this point ran; fix the error above and rerun"
 

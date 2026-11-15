@@ -14921,20 +14921,20 @@ network_policies:
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
-        // Skip if /bin/bash is not present (e.g. minimal containers).
-        if !std::path::Path::new("/bin/bash").exists() {
-            eprintln!("skipping: /bin/bash not available");
+        // Skip if no usable bash is on PATH (e.g. minimal containers).
+        let Some(bash) = crate::test_support::host_tool("bash") else {
+            eprintln!("skipping: bash not available on PATH");
             return;
-        }
+        };
 
         // 1. Start a listener on loopback.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let proxy_addr = listener.local_addr().unwrap();
 
-        // 2. Copy /bin/bash to a temp path.
+        // 2. Copy bash to a temp path.
         let tmp = tempfile::TempDir::new().unwrap();
         let bash_v1 = tmp.path().join("hotswap-bash");
-        std::fs::copy("/bin/bash", &bash_v1).expect("copy bash");
+        std::fs::copy(&bash, &bash_v1).expect("copy bash");
         std::fs::set_permissions(&bash_v1, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // 3. Prime the cache with the v1 hash of the temp bash.
@@ -15045,10 +15045,11 @@ network_policies:
         use std::net::{TcpListener, TcpStream};
         use std::time::{Duration, Instant};
 
-        if !std::path::Path::new("/bin/sleep").exists() {
-            eprintln!("skipping: /bin/sleep not available");
+        let Some(sleep) = crate::test_support::host_tool("sleep") else {
+            eprintln!("skipping: sleep not available on PATH");
             return;
-        }
+        };
+        let sleep_meta = std::fs::metadata(&sleep).expect("stat sleep");
 
         if std::process::Command::new("getenforce")
             .output()
@@ -15071,10 +15072,14 @@ network_policies:
         let child_pid = guard.0.id();
         let entrypoint_pid = std::process::id();
 
+        // Compare file identity rather than the exe name: NixOS coreutils are
+        // multi-call symlinks, so exec'ing `sleep` reports `.../bin/coreutils`.
+        use std::os::unix::fs::MetadataExt;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
-                && link.to_string_lossy().contains("sleep")
+            if let Ok(meta) = std::fs::metadata(format!("/proc/{child_pid}/exe"))
+                && meta.dev() == sleep_meta.dev()
+                && meta.ino() == sleep_meta.ino()
             {
                 break;
             }

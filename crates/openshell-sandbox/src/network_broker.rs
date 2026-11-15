@@ -1751,13 +1751,25 @@ mod tests {
             "/proc/net/tcp6"
         };
         let inode = inode.to_string();
-        assert!(
-            !std::fs::read_to_string(table).unwrap().lines().any(|line| {
+        // A listener with queued children releases its `/proc` entry only once
+        // those children are reaped, which is asynchronous. Under a fully
+        // parallel test run that lags past the close, so poll with a deadline
+        // instead of sampling the table once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listed = std::fs::read_to_string(table).unwrap().lines().any(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
                 fields.get(3) == Some(&"0A") && fields.get(9) == Some(&inode.as_str())
-            }),
-            "closed listener remains in {table}"
-        );
+            });
+            if !listed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "closed listener remains in {table}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             TcpStream::connect_timeout(&address, Duration::from_secs(1))
                 .expect_err("closed listener accepted a connection")

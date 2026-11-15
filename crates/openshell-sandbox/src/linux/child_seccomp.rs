@@ -563,7 +563,8 @@ mod tests {
                 .expect("pthread-style child must start");
             assert_eq!(joined, 17);
             assert!(
-                std::process::Command::new("/bin/true")
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", "exit 0"])
                     .status()
                     .expect("posix-spawn-style child must start")
                     .success()

@@ -179,7 +179,9 @@ async fn local_vm_rejects_nonexecutable_and_unsupported_tools() {
 #[tokio::test]
 async fn local_vm_rejects_hanging_tool_with_deadline() {
     let fixture = Fixture::new();
-    fixture.tool("mke2fs", "exec /bin/sleep 30");
+    // The preflight runs with PATH set to the fixture tool directory, so the
+    // hung tool must spin on shell builtins rather than call `sleep`.
+    fixture.tool("mke2fs", "while :; do :; done");
     let start = std::time::Instant::now();
     let output = fixture.run(&[]).await;
     assert!(!output.status.success());
@@ -201,11 +203,17 @@ async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
         let fixture = Fixture::new();
         let ready = fixture.root.path().join("probe-ready");
         let survived = fixture.root.path().join("survived-signal");
+        // The descendant waits on a gate file instead of `sleep`: the sanitized
+        // PATH has no coreutils, and releasing the gate after the signal proves
+        // the descendant is really gone rather than merely still asleep.
+        let gate = fixture.root.path().join("release-descendant");
         fixture.tool(
             "mke2fs",
             &format!(
-                "(echo ready > '{}'; /bin/sleep 2; echo survived > '{}') &\nwait",
+                "(echo ready > '{}'; while [ ! -e '{}' ]; do :; done; \
+                 echo survived > '{}') &\nwait",
                 ready.display(),
+                gate.display(),
                 survived.display()
             ),
         );
@@ -232,6 +240,12 @@ async fn signals_stop_probe_wrapper_and_descendants_before_cli_exit() {
         assert!(!output.status.success());
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!survived.exists(), "probe descendant survived {signal}");
+        fs::write(&gate, b"").expect("release descendant gate");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !survived.exists(),
+            "probe descendant outlived {signal} and resumed"
+        );
         assert!(
             combined(&output).contains(&format!("interrupted by {signal}")),
             "{}",

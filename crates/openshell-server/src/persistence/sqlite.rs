@@ -249,7 +249,14 @@ impl SqliteStore {
 
         let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // sqlx defaults to a 5 s busy timeout. With `synchronous=FULL` in
+            // WAL mode every commit serializes behind an fsync, and a busy disk
+            // can hold the write lock past that, failing a valid write with
+            // `database is locked`. Waiting longer is preferable to a spurious
+            // 500; a genuinely dead writer is detected by the pool's own
+            // acquire timeout instead.
+            .busy_timeout(std::time::Duration::from_secs(30));
 
         if is_in_memory {
             if options.get_filename().as_os_str().is_empty()

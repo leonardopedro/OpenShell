@@ -38,6 +38,29 @@ openshell sandbox create --name demo
 
 The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
 
+## Verify a Packaged Chutes Edge
+
+The Linux packages also install `openshell-chutes-edge`, a system service that terminates Chutes end-to-end encryption in front of the gateway. Installation does not create its key file or enable it. After `apt-get install ./openshell_<version>_amd64.deb` or `rpm -i openshell-<version>.x86_64.rpm`, write the key file and start the unit:
+
+```shell
+sudo install -d -m 0755 /etc/openshell
+sudo sh -c 'umask 077; printf "CHUTES_API_KEY=%s\n" "$KEY" > /etc/openshell/chutes-edge.env'
+sudo systemctl enable --now openshell-chutes-edge
+```
+
+Then confirm the service is sandboxed as shipped and can reach Chutes:
+
+```shell
+systemctl show -p User -p DynamicUser -p ProtectSystem -p ProtectHome openshell-chutes-edge
+systemd-analyze security openshell-chutes-edge | tail -1
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/v1/chutes/models \
+  -H "Authorization: Bearer $KEY"
+```
+
+Expect `DynamicUser=yes` with `ProtectSystem=strict`, an exposure level near `1.4 OK`, and `200` from the models route. `sudo systemctl restart openshell-chutes-edge` should return in well under a second. If it hangs, the shipped unit is missing its `KillSignal=SIGINT`: the server ignores `SIGTERM`.
+
+See [Installation](https://docs.nvidia.com/openshell/latest/about/installation) for the remaining `CHUTES_*` settings and for what a `402` from the API means.
+
 ## Explore Further
 
 - [Sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview): images, runtimes, GPUs, and lifecycle.

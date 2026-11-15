@@ -49,6 +49,9 @@ required_prebuilt_binaries() {
 		supervisor|supervisor-sideload|supervisor-output)
 			echo "openshell-supervisor"
 			;;
+		chutes-edge)
+			echo "openshell-chutes-edge"
+			;;
 	esac
 }
 
@@ -95,7 +98,7 @@ ensure_prebuilt_binaries() {
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|sandbox|supervisor|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|sandbox|supervisor|supervisor-output|chutes-edge> [extra-args...]"}
 shift
 
 IS_FINAL_IMAGE=0
@@ -127,6 +130,12 @@ case "${TARGET}" in
     IMAGE_NAME="openshell/supervisor"
     DOCKER_TARGET="supervisor"
     DOCKERFILE="deploy/docker/Dockerfile.supervisor"
+    ;;
+  chutes-edge)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/chutes-edge"
+    DOCKER_TARGET="chutes-edge"
+    DOCKERFILE="deploy/docker/Dockerfile.chutes-edge"
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2
