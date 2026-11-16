@@ -54,6 +54,8 @@ binaries:
   # openshell-nixos/infinity-sandbox: the binary is a host Nix store path
   # (content-addressed, so the hash is matched, not spelled out).
   - /nix/store/*-infinity/bin/infinity-provider-openai
+  # `sandbox upload` installs here; allow it for upload-based deployments.
+  - /sandbox/bin/infinity-provider-openai
   - /sandbox/.local/bin/infinity-provider-openai
   - /usr/local/bin/infinity-provider-openai
   - /sandbox/.cargo/bin/infinity-provider-openai

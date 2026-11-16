@@ -237,6 +237,19 @@ if [[ "${DRY_RUN:-0}" != 1 ]]; then
 fi
 
 # ── Assemble the sandbox ──────────────────────────────────────────────────
+# Infinity has no positional prompt argument: a bare task is `--initial-message`
+# (or `--headless` for a one-shot run that exits without the TUI). Translate the
+# documented `./infinity-sandbox -- "explain this repo"` form while passing any
+# real flags through untouched.
+INFINITY_ARGS=()
+# Drop the conventional `--` separator before deciding what the args mean.
+[[ "${1-}" != "--" ]] || shift
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  INFINITY_ARGS+=(--initial-message "$1")
+  shift
+fi
+INFINITY_ARGS+=("$@")
+
 # Paths go into JSON unescaped; refuse anything that would break it.
 for p in "$PROJECTS_DIR" "$INFINITY_STORE" "$TOOL_PATH" "$LD_LIBRARY_PATH_VALUE"; do
   [[ "$p" != *\"* && "$p" != *\\* ]] || die "path contains a quote/backslash, refusing to build JSON: $p"
@@ -253,9 +266,11 @@ DRIVER_CONFIG="{\"vm\":{\"backend\":\"cloud-hypervisor\",\"mounts\":$MOUNTS}}"
 GUEST_CMD="export PATH=$INFINITY_STORE/bin:${TOOL_PATH}\$PATH; export LD_LIBRARY_PATH=$LD_LIBRARY_PATH_VALUE:\${LD_LIBRARY_PATH:-}; export HOME=/workspace/.infinity-home; cd /workspace 2>/dev/null || cd /; exec $INFINITY_STORE/bin/infinity \"\$@\""
 
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
-  printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q %s \\\n  -- sh -c %q sh %s\n' \
+  printf 'openshell sandbox create --name %s \\\n  --driver-config-json %q \\\n  --policy %q %s \\\n  -- sh -c %q sh' \
     "$SANDBOX_NAME" "$DRIVER_CONFIG" "$SCRIPT_DIR/sandbox-policy.yaml" \
-    "${ENV_ARGS[*]:-}" "$GUEST_CMD" "$*"
+    "${ENV_ARGS[*]:-}" "$GUEST_CMD"
+  [[ ${#INFINITY_ARGS[@]} -eq 0 ]] || printf ' %q' "${INFINITY_ARGS[@]}"
+  printf '\n'
   exit 0
 fi
 
@@ -263,4 +278,4 @@ exec openshell sandbox create --name "$SANDBOX_NAME" \
   --driver-config-json "$DRIVER_CONFIG" \
   --policy "$SCRIPT_DIR/sandbox-policy.yaml" \
   "${ENV_ARGS[@]}" \
-  -- sh -c "$GUEST_CMD" sh "$@"
+  -- sh -c "$GUEST_CMD" sh "${INFINITY_ARGS[@]}"

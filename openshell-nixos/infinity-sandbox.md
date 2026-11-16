@@ -176,6 +176,15 @@ The launcher:
 any state writes land back in the mounted project directory on the host
 (`.infinity-home` is rebuilt on every launch; remove it to reset agent state).
 
+A bare task after `--` is translated to Infinity's `--initial-message`; any
+flag is passed through unchanged, so a one-shot task that exits without the TUI
+uses `--headless`:
+
+```sh
+PROJECTS_DIR=~/code ./infinity-sandbox -- "explain this repo"
+PROJECTS_DIR=~/code ./infinity-sandbox -- --headless "explain this repo"
+```
+
 Useful knobs: `SANDBOX_GPU` (1 = host GPU model via `edge0-gpu`, see above),
 `EDGE0_GPU_PORT` (default 8001), `SANDBOX_NAME`, `EDGE0_MODEL`,
 `EDGE0_CONTEXT_WINDOW`, `EDGE0_BASE_URL`, `EDGE0_API_KEY_FILE`,
@@ -188,14 +197,36 @@ without running it.
 Checked here:
 
 - `bash -n infinity-sandbox`, `DRY_RUN=1 ./infinity-sandbox` (prints the create
-  command with the store path and mount JSON).
+  command with the store path and mount JSON; a bare task becomes
+  `--initial-message`, flags pass through).
 - `nix store add-path` of the three binaries, and that the resulting path holds
-  `bin/{infinity,infinity-provider-openai,sandbox-local}`.
+  `bin/{infinity,infinity-provider-openai,sandbox-local}` (both debug and
+  release builds).
+- `cargo build --release -p infinity-agent-cli -p infinity-provider-openai
+  -p sandbox-local` in `../../infinity`.
+- `./check.bash` in `../../infinity` (all steps, with `jj` on `PATH`), and
+  `cargo test -p infinity-provider-openai` (unit, binary and doc tests).
+- Both provider profiles parse as YAML and pass `openshell provider profile
+  lint` against a live gateway; the OpenShell CLI and gateway build from source.
+- `tasks/scripts/vm/download-kernel-runtime.sh` now falls back to `curl` when
+  `gh` is absent, so `vm-setup.sh` can stage libkrun/umoci without GitHub CLI.
+  With the `x86_64-unknown-linux-musl` Rust target installed, `vm:supervisor`
+  bundles the guest binaries and the source-built VM driver links them in.
 
-Not checked here (needs a running gateway with the VM driver and the patched
-VMM, which this machine does not have): an actual cloud-hypervisor boot, the
-VirtioFS `/nix` mount inside the guest, and the policy/provider attach. If a
-guest command fails with `EACCES` on `/nix` or `/workspace`, the Landlock policy
-in [`sandbox-policy.yaml`](sandbox-policy.yaml) is the place to look; a denied
-model call means the provider profile's `binaries` entries do not match the
-store path.
+Not checked here: an actual cloud-hypervisor boot of this launcher. The VM
+driver itself boots fine with the packaged libkrun backend, and the full
+Edge0 → Infinity provider → Infinity harness chain was verified inside that
+sandbox. The cloud-hypervisor backend is blocked on this host by binary
+compatibility, not by this repo: the fork-built CH v50 aborts with
+`fatal runtime error: IO Safety violation` after virtiofsd disconnects;
+upstream v49 cannot connect the vhost-user socket; v54 rejects the driver's
+config (`Validation(ImageTypeRequired)`). virtiofsd 1.14 also warns it cannot
+set root uid/gid and must disable file handles as an unprivileged user. Use a
+matching CH/virtiofsd pair (or a privileged gateway) before relying on this
+backend.
+
+If a guest command fails with `EACCES` on `/nix` or `/workspace`, the Landlock
+policy in [`sandbox-policy.yaml`](sandbox-policy.yaml) is the place to look; a
+denied model call means the provider profile's `binaries` entries do not match
+the store path (uploaded binaries need `/sandbox/bin/infinity-provider-openai`,
+now listed in both profiles).

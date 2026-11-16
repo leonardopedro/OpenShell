@@ -69,25 +69,26 @@ echo "    Artifact:   ${TARBALL_NAME}"
 echo "    Output:     ${OUTPUT_DIR}"
 echo ""
 
-# ── Check for gh CLI ────────────────────────────────────────────────────
-
-if ! command -v gh &>/dev/null; then
-    echo "Error: GitHub CLI (gh) is required." >&2
-    echo "  Install: https://cli.github.com/" >&2
-    exit 1
-fi
-
 # ── Download the runtime tarball ────────────────────────────────────────
 
 DOWNLOAD_DIR="${ROOT}/target/vm-runtime-download"
 mkdir -p "$DOWNLOAD_DIR" "$OUTPUT_DIR"
 
 echo "==> Downloading ${TARBALL_NAME} from ${RELEASE_TAG}..."
-gh release download "${RELEASE_TAG}" \
-    --repo "${REPO}" \
-    --pattern "${TARBALL_NAME}" \
-    --dir "${DOWNLOAD_DIR}" \
-    --clobber
+if command -v gh &>/dev/null; then
+    gh release download "${RELEASE_TAG}" \
+        --repo "${REPO}" \
+        --pattern "${TARBALL_NAME}" \
+        --dir "${DOWNLOAD_DIR}" \
+        --clobber
+else
+    # Public release assets are reachable without the GitHub CLI: gh is only
+    # needed for authenticated/private releases. Keep unauthenticated setups
+    # working with plain curl.
+    asset_url="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${TARBALL_NAME}"
+    echo "    gh not found; using curl ${asset_url}"
+    curl -fSL --retry 3 -o "${DOWNLOAD_DIR}/${TARBALL_NAME}" "${asset_url}"
+fi
 
 if [ ! -f "${DOWNLOAD_DIR}/${TARBALL_NAME}" ]; then
     echo "Error: Download failed — ${TARBALL_NAME} not found." >&2

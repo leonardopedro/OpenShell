@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# herdr-core-agent — run Infinity (inside an OpenShell sandbox) as a persistent
+# herdr-core terminal, so it shows up in the Herdr mobile app / `hc ls`.
+#
+# The phone talks SSH to `hc` on this host; `hc` owns the PTY and keeps it
+# alive across disconnects. The program in that PTY is `infinity-sandbox`,
+# which starts the OpenShell cloud-hypervisor VM with the store-baked
+# Infinity harness and points it at the host-served Edge0 35B endpoint.
+#
+#   ./herdr-core-agent edge0 -- --headless "explain this repo"
+#   ./herdr-core-agent --list
+#   ./herdr-core-agent --attach edge0          # Ctrl-\ detaches
+#   ./herdr-core-agent --read edge0
+#   ./herdr-core-agent --stop edge0
+#
+# Knobs: HC_BIN, INFINITY_SANDBOX, PROJECTS_DIR, SANDBOX_GPU, DRY_RUN=1.
+set -euo pipefail
+
+die() { printf 'herdr-core-agent: %s\n' "$*" >&2; exit 1; }
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+
+# OSC 7501 is herdr-core's Program Status Protocol. Infinity does not emit
+# it yet, so this wrapper reports a coarse status: idle while the agent is
+# up, done when it exits. Per-turn working/blocked needs support in Infinity.
+emit_status() {
+  printf '\033]7501;state=%s:app=infinity\033\\' "$1"
+}
+
+resolve_hc() {
+  if [[ -n "${HC_BIN:-}" ]]; then printf '%s' "$HC_BIN"; return; fi
+  if command -v hc >/dev/null 2>&1; then command -v hc; return; fi
+  # No hc on PATH (typical for a Nix store install): build the flake package.
+  local out
+  out="$(cd "$SCRIPT_DIR" && nix build --no-link --print-out-paths .#herdr-core 2>/dev/null)" || return 1
+  printf '%s/bin/hc' "$out"
+}
+
+# ── Internal mode: the program hc actually starts ──────────────────────────
+if [[ "${1-}" == "__runner" ]]; then
+  shift
+  [[ $# -ge 1 ]] || die "runner needs a terminal name"
+  shift # the name is only used for the status message
+  emit_status idle
+  trap 'emit_status done' EXIT
+  "$@"
+  exit $?
+fi
+
+HC="$(resolve_hc)" || die "cannot find hc (install herdr-core or set HC_BIN)"
+[[ -x "$HC" ]] || die "hc is not executable: $HC"
+
+action="${1-}"
+case "$action" in
+  --list)  exec "$HC" ls --all ;;
+  --attach)
+    [[ $# -ge 2 ]] || die "--attach needs a terminal name"
+    exec "$HC" attach "$2" ;;
+  --read)
+    [[ $# -ge 2 ]] || die "--read needs a terminal name"
+    exec "$HC" read "$2" --lines 100 ;;
+  --stop)
+    [[ $# -ge 2 ]] || die "--stop needs a terminal name"
+    exec "$HC" kill "$2" ;;
+  --help|-h)
+    sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+NAME="${1:-infinity}"
+if [[ $# -gt 0 ]]; then shift; fi
+[[ "${1-}" != "--" ]] || shift
+
+LAUNCHER="${INFINITY_SANDBOX:-$SCRIPT_DIR/infinity-sandbox}"
+[[ -x "$LAUNCHER" ]] || die "infinity-sandbox launcher missing: $LAUNCHER"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
+[[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
+SANDBOX_GPU="${SANDBOX_GPU:-0}"
+
+# The core must be running before `hc run` can own a PTY.
+if ! "$HC" server status >/dev/null 2>&1; then
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    printf '%q ' "$HC" server start
+    printf '\n'
+  else
+    "$HC" server start >&2
+  fi
+fi
+
+# Non-secret knobs only: the Edge0 API key is read by infinity-sandbox from
+# ~/.edge0/api-key inside the terminal, never placed in hc's saved argv.
+CMD=(
+  env
+  "PROJECTS_DIR=$PROJECTS_DIR"
+  "SANDBOX_NAME=$NAME"
+  "SANDBOX_GPU=$SANDBOX_GPU"
+  "$LAUNCHER"
+  "$@"
+)
+
+RUN=(
+  "$HC" run --bg
+  --name "$NAME"
+  --label app=infinity
+  --label runtime=openshell
+  --
+  "$SELF" __runner "$NAME" "${CMD[@]}"
+)
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf '%q ' "${RUN[@]}"
+  printf '\n'
+  exit 0
+fi
+
+"${RUN[@]}"
+printf 'herdr-core-agent: terminal %s started; attach with: %s --attach %s\n' \
+  "$NAME" "$SELF" "$NAME" >&2

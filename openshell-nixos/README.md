@@ -152,6 +152,13 @@ driver's cloud-hypervisor VMM + kernel configured (`OPENSHELL_VM_CH_PATH`,
 policy layout, and troubleshooting are in
 [infinity-sandbox.md](infinity-sandbox.md).
 
+To control those agents from a phone or another laptop, this folder also
+packages **herdr-core** (`hc`, the runtime behind the Herdr mobile app) and
+provides `herdr-core-agent`, which runs an Infinity sandbox as a persistent
+`hc` terminal reachable over SSH. See
+[herdr-core.md](herdr-core.md) for the Nix install, core config and phone
+setup.
+
 ## Security decisions (read before weakening)
 
 * **`/nix` is read-only.** `SHARE_NIX_RW=1` flips it (and the config's

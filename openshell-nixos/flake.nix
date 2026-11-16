@@ -48,6 +48,12 @@
         # (one source; no second copy to drift).
         openshell = pkgs.callPackage ./openshell-package.nix { };
 
+        # herdr-core (`hc`) from the pinned official release tarball (the
+        # pinned nixpkgs predates it). Herdr TUI comes from nixpkgs: it is the
+        # same 0.9.5 source as ../herdr, without pinning that checkout here.
+        herdr-core = pkgs.callPackage ./herdr-core-package.nix { };
+        herdr = pkgs.herdr;
+
         default = self.packages.${system}.openshell;
       };
 
@@ -55,6 +61,10 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.openshell}/bin/openshell";
+        };
+        hc = {
+          type = "app";
+          program = "${self.packages.${system}.herdr-core}/bin/hc";
         };
       };
     };
