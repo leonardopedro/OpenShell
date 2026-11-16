@@ -1,0 +1,37 @@
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /lib64
+    - /etc
+    - /proc
+    - /var/log
+    - /dev/urandom
+    - /nix
+  read_write:
+    - /tmp
+    - /dev/null
+    - /workspace
+
+landlock:
+  compatibility: hard_requirement
+
+# Declared up front so the guest DNS proxy assigns stable virtual IPs.
+network_policies:
+  freebuff:
+    name: Freebuff and Codebuff APIs
+    endpoints:
+      - { host: freebuff.com, port: 443, protocol: rest, access: read-write }
+      - { host: www.freebuff.com, port: 443, protocol: rest, access: read-write }
+      - { host: www.codebuff.com, port: 443, protocol: rest, access: read-write }
+      - { host: codebuff.com, port: 443, protocol: rest, access: read-write }
+      - { host: api.codebuff.com, port: 443, protocol: rest, access: read-write }
+    binaries:
+      - path: /workspace/fb-1/.config/manicode/freebuff
+      - path: /workspace/fb-2/.config/manicode/freebuff
+      - path: /workspace/fb-3/.config/manicode/freebuff
+      - path: /sandbox/bin/busybox

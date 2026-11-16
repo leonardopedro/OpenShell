@@ -10,8 +10,9 @@
 #   DRY_RUN=1 ./fb-fleet             # print the commands only
 #
 # First-run requirements (see fleet-plan.md):
-#   * approve egress once per session binary:
-#       openshell policy update <VM> --add-endpoint freebuff.com:443 \
+#   * approve egress once per session binary (use fleet-policy.yaml; Freebuff
+#     calls www.codebuff.com in addition to freebuff.com):
+#       openshell policy update <VM> --add-endpoint www.codebuff.com:443 \
 #         --binary /workspace/<session>/.config/manicode/freebuff
 #   * Freebuff credentials are keyring-backed on the host, so copying
 #     credentials.json into the guest does not authenticate: each session

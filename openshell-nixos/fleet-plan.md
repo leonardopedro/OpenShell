@@ -89,9 +89,10 @@ Mounts: `/nix` ro and `$FLEET_DIR` → `/workspace` rw. Both Freebuff and Infini
 - [x] Plan written (`fleet-plan.md`).
 - [x] `fb-fleet` launcher implemented: stages per-session state with `cp -a`, bakes Infinity into the Nix store, creates one libkrun+DAX VM with `/nix` ro + project rw, and starts one `hc` terminal per session. `DRY_RUN=1` verified.
 - [x] Laptop-1 slice executed here: VM `fleet` is Ready; 3 Freebuff binaries + 1 Infinity harness (with its provider) are running inside it; `hc ls` shows `fb-1`, `fb-2`, `fb-3`, `inf-1`.
-- [x] Freebuff egress approved through OpenShell policy: `freebuff.com:443` added per Freebuff binary path. Without it the CLI failed at `POST /api/auth/cli/code`.
+- [x] Freebuff egress approved through `fleet-policy.yaml`: `freebuff.com:443`, `www.freebuff.com:443`, `www.codebuff.com:443`, `codebuff.com:443`, `api.codebuff.com:443` for the three Freebuff binaries. The critical missing host was **`www.codebuff.com`** — its denial (`policy_dns_ineligible` / `transparent_tcp_policy_denied`) is what produced "Can't reach Freebuff's servers". Diagnose with `openshell logs <VM> --since 5m --source sandbox`.
+- [x] Verified a real Freebuff turn inside the VM: after login it auto-switched to the unlimited `Beam 1.0` model (DeepSeek Flash Fast needed 3 h of allowance) and replied `PONG`.
 - [x] Verified the Infinity terminal inside the VM reaches Edge0 through `host.openshell.internal:8001` and answers `PONG.`
-- [ ] **User action:** each Freebuff terminal needs one interactive device login in the VM — the host credentials are keyring-backed, so `~/.config/manicode/credentials.json` alone does not authenticate in the guest. Three login links are on the `fb-*` screens; complete them once, then sessions persist.
+- [ ] **User action:** `fb-2` and `fb-3` still need one interactive device login in the VM — the host credentials are keyring-backed, so `~/.config/manicode/credentials.json` alone does not authenticate in the guest. Press Enter on their screens to get fresh links and approve them promptly (codes expire in ~10 min).
 - [ ] Laptops 2 and 3: identical `fb-fleet` run by the operator (only one machine is available in this session).
 - [ ] `hc machine add` for l2/l3 and the Android Herdr Mobile connection (needs the other machines/phone).
 - [ ] Tailscale SSH: `sudo tailscale set --ssh` plus an SSH ACL on the tailnet (no sudo was available in this agent session; no sudo was needed for the executed steps).
