@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # infinity-sandbox — run Infinity Code inside an OpenShell microVM on the
-# cloud-hypervisor backend, with Infinity "baked in" through the shared Nix
-# store instead of uploaded into a container.
+# libkrun backend, with Infinity "baked in" through the shared Nix store
+# instead of uploaded into a container. libkrun is the backend that supports
+# bind mounts and DAX windows (host page-cache sharing); SANDBOX_VM_BACKEND=
+# cloud-hypervisor opts into the experimental CH path.
 #
 #   ./infinity-sandbox                       # Infinity in $PROJECTS_DIR
 #   ./infinity-sandbox -- "explain this repo"
@@ -33,16 +35,18 @@
 #   freebuff-sandbox uses for ~/.config/manicode, so state written in the
 #   sandbox lands on the host's real files.
 #
-# Two mounts (virtiofs shares of virtiofsd, provided by the fork's
-# cloud-hypervisor backend; x86_64 allows three):
+# Two mounts (virtiofs shares provided by the libkrun backend, up to three
+# on x86_64; with OPENSHELL_VM_DAX_WINDOW_MIB set on the gateway each share
+# also gets a DAX window so guest I/O maps the host page cache):
 #   /nix          ro   host Nix store = guest store: Infinity's binaries and
 #                      every library they need, plus the guest tools
 #   $PROJECTS_DIR rw   /workspace: the code the agent edits — and
 #                      /workspace/.infinity-home, the guest's HOME.
 #
-# The backend is selected per sandbox in driver_config.vm.backend, so the
-# gateway's default (libkrun) stays untouched. cloud-hypervisor needs a guest
-# kernel and the patched binary; see the checked env vars below and README.md.
+# The backend is selected per sandbox in driver_config.vm.backend. Leaving it
+# unset keeps libkrun (and its DAX memory sharing) as the gateway default;
+# SANDBOX_VM_BACKEND=cloud-hypervisor needs a guest kernel and a patched CH
+# binary — see the checked env vars below and README.md.
 set -euo pipefail
 
 die() { printf 'infinity-sandbox: %s\n' "$*" >&2; exit 1; }
@@ -69,6 +73,10 @@ SANDBOX_NAME="${SANDBOX_NAME:-infinity}"
 # sandbox uses the `edge0-gpu` provider profile; 0 = whatever profile/endpoint
 # you name. See the GPU profile note at the top of this file.
 SANDBOX_GPU="${SANDBOX_GPU:-0}"
+# libkrun is the default: it is the backend that supports virtiofs bind mounts
+# and DAX windows (host page-cache sharing). Only set this to cloud-hypervisor
+# for the experimental CH path; both mount sharing and DAX are needed here.
+SANDBOX_VM_BACKEND="${SANDBOX_VM_BACKEND:-libkrun}"
 EDGE0_GPU_PORT="${EDGE0_GPU_PORT:-8001}"
 # Provider instance to attach (from `openshell provider create --name edge0
 # --type edge0-openai`); empty means none, and egress to the model server
@@ -225,13 +233,13 @@ ENV_ARGS=()
 [[ -n "$INFINITY_OPENAI_API_KEY" ]] && ENV_ARGS+=(--env-from INFINITY_OPENAI_API_KEY)
 [[ -n "$SANDBOX_PROVIDER" ]] && ENV_ARGS+=(--provider "$SANDBOX_PROVIDER")
 
-# ── cloud-hypervisor requirements ─────────────────────────────────────────
+# ── cloud-hypervisor requirements (opt-in backend only) ───────────────────
 # The driver resolves the VMM from OPENSHELL_VM_CH_PATH and the guest kernel
 # from OPENSHELL_VM_CH_KERNEL (or ../cloud-hypervisor-build/workloads/…). Both
 # are read by the *gateway/driver* process, so they must be in its
 # environment, not just this shell's: a user unit picks them up from
 # ~/.config/systemd/user/openshell-gateway.service.
-if [[ "${DRY_RUN:-0}" != 1 ]]; then
+if [[ "$SANDBOX_VM_BACKEND" == cloud-hypervisor && "${DRY_RUN:-0}" != 1 ]]; then
   [[ -n "${OPENSHELL_VM_CH_PATH:-}" ]] || printf 'infinity-sandbox: warning: OPENSHELL_VM_CH_PATH is unset — the driver expects cloud-hypervisor on PATH (set it in the gateway unit to use the fork-built binary)\n' >&2
   [[ -n "${OPENSHELL_VM_CH_KERNEL:-}" ]] || printf 'infinity-sandbox: warning: OPENSHELL_VM_CH_KERNEL is unset — falling back to ../cloud-hypervisor-build/workloads/vmlinux-x86_64 (see README.md for the download)\n' >&2
 fi
@@ -255,10 +263,18 @@ for p in "$PROJECTS_DIR" "$INFINITY_STORE" "$TOOL_PATH" "$LD_LIBRARY_PATH_VALUE"
   [[ "$p" != *\"* && "$p" != *\\* ]] || die "path contains a quote/backslash, refusing to build JSON: $p"
 done
 
-# Three mounts; cloud-hypervisor (unlike QEMU) accepts virtiofs mounts.
+# Two mounts over libkrun virtiofs shares (up to three on x86_64). With
+# OPENSHELL_VM_DAX_WINDOW_MIB set on the gateway, the guest maps the host page
+# cache instead of copying file contents through the virtqueue.
 MOUNTS="[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},"
 MOUNTS+="{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}]"
-DRIVER_CONFIG="{\"vm\":{\"backend\":\"cloud-hypervisor\",\"mounts\":$MOUNTS}}"
+if [[ "$SANDBOX_VM_BACKEND" == libkrun ]]; then
+  # Leave `backend` unset: it defaults to libkrun, the only backend that
+  # admits bind mounts and exposes the DAX window.
+  DRIVER_CONFIG="{\"vm\":{\"mounts\":$MOUNTS}}"
+else
+  DRIVER_CONFIG="{\"vm\":{\"backend\":\"$SANDBOX_VM_BACKEND\",\"mounts\":$MOUNTS}}"
+fi
 
 # The guest shell: store binaries + nixpkgs tools on PATH, loader search path
 # for anything Infinity links out of the store, HOME through the workspace

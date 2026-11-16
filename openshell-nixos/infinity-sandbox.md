@@ -1,7 +1,11 @@
-# Infinity in a cloud-hypervisor microVM, baked through the shared Nix store
+# Infinity in an OpenShell microVM, baked through the shared Nix store
 
 `infinity-sandbox` runs [Infinity Code](../../infinity) as the workload of an
-OpenShell sandbox on the fork's **cloud-hypervisor** VM backend. Infinity is not
+OpenShell sandbox. It defaults to the **libkrun** backend: that is the backend
+that admits the two bind mounts and exposes a DAX window, so the guest maps
+host Nix-store pages directly instead of copying them (`OPENSHELL_VM_DAX_WINDOW_MIB`
+on the gateway, 128 MiB in the NixOS install). `SANDBOX_VM_BACKEND=cloud-hypervisor`
+opts into the experimental CH path. Infinity is not
 uploaded into the sandbox and no image is rebuilt to upgrade it: the three
 binaries are added to the host's Nix store, the store is mounted read-only into
 the guest at the same path (VirtioFS + DAX, the mechanism described in
@@ -167,10 +171,10 @@ The launcher:
    binary, plus `rap.json` registering `sandbox-local --enable-sandbox=false`
    (OpenShell's VM is the isolation boundary; Bubblewrap cannot nest inside the
    supervisor);
-4. creates the sandbox with
-   `driver_config.vm.backend = "cloud-hypervisor"`, the two mounts, the edge0
-   provider attached, and `INFINITY_OPENAI_API_KEY` from `~/.edge0/api-key`
-   passed with `--env-from` so the token never appears in a command line.
+4. creates the sandbox with the two mounts (and no explicit backend, so the
+   driver uses libkrun and its DAX window), the edge0 provider attached, and
+   `INFINITY_OPENAI_API_KEY` from `~/.edge0/api-key` passed with `--env-from`
+   so the token never appears in a command line.
 
 `HOME` inside the guest is `/workspace/.infinity-home`, so sessions, history and
 any state writes land back in the mounted project directory on the host
@@ -185,7 +189,8 @@ PROJECTS_DIR=~/code ./infinity-sandbox -- "explain this repo"
 PROJECTS_DIR=~/code ./infinity-sandbox -- --headless "explain this repo"
 ```
 
-Useful knobs: `SANDBOX_GPU` (1 = host GPU model via `edge0-gpu`, see above),
+Useful knobs: `SANDBOX_VM_BACKEND` (`libkrun` default, or `cloud-hypervisor`
+opt-in), `SANDBOX_GPU` (1 = host GPU model via `edge0-gpu`, see above),
 `EDGE0_GPU_PORT` (default 8001), `SANDBOX_NAME`, `EDGE0_MODEL`,
 `EDGE0_CONTEXT_WINDOW`, `EDGE0_BASE_URL`, `EDGE0_API_KEY_FILE`,
 `INFINITY_BIN_DIR`, `INFINITY_TOOLS` (default `ripgrep git`, empty to rely on
@@ -213,17 +218,20 @@ Checked here:
   With the `x86_64-unknown-linux-musl` Rust target installed, `vm:supervisor`
   bundles the guest binaries and the source-built VM driver links them in.
 
-Not checked here: an actual cloud-hypervisor boot of this launcher. The VM
-driver itself boots fine with the packaged libkrun backend, and the full
-Edge0 → Infinity provider → Infinity harness chain was verified inside that
-sandbox. The cloud-hypervisor backend is blocked on this host by binary
-compatibility, not by this repo: the fork-built CH v50 aborts with
-`fatal runtime error: IO Safety violation` after virtiofsd disconnects;
-upstream v49 cannot connect the vhost-user socket; v54 rejects the driver's
-config (`Validation(ImageTypeRequired)`). virtiofsd 1.14 also warns it cannot
-set root uid/gid and must disable file handles as an unprivileged user. Use a
-matching CH/virtiofsd pair (or a privileged gateway) before relying on this
-backend.
+Checked with libkrun (the default): a real launch of this exact script boots
+the VM, shares `/nix` read-only and `$PROJECTS_DIR` read-write at `/workspace`,
+and execs the store-baked Infinity binary from `/nix/store` in the guest. The
+gateway was started with `OPENSHELL_VM_DAX_WINDOW_MIB=128`; the guest rootfs
+carries the DAX mount manifest. The full Edge0 → Infinity provider → Infinity
+harness chain was also verified inside a libkrun sandbox (returning `PONG.`).
+
+The opt-in `SANDBOX_VM_BACKEND=cloud-hypervisor` path is not bootable on this
+host, due to upstream binary compatibility rather than this repo: fork-built
+CH v50 aborts with `fatal runtime error: IO Safety violation` after virtiofsd
+disconnects; upstream v49 cannot connect the vhost-user socket; v54 rejects
+the driver's config (`Validation(ImageTypeRequired)`). virtiofsd 1.14 also
+warns it cannot set root uid/gid as an unprivileged user. Use a matching
+CH/virtiofsd pair (or a privileged gateway) before relying on that backend.
 
 If a guest command fails with `EACCES` on `/nix` or `/workspace`, the Landlock
 policy in [`sandbox-policy.yaml`](sandbox-policy.yaml) is the place to look; a
