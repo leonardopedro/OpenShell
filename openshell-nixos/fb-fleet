@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# fb-fleet — one OpenShell VM per laptop, many agent sessions inside it.
+#
+# Stages per-session Freebuff Starter state, bakes the Infinity harness into
+# the Nix store, creates a single libkrun+DAX sandbox, and starts one
+# herdr-core terminal per session via `openshell sandbox exec`.
+#
+#   ./fb-fleet                       # 3 Freebuff + 1 Infinity, laptop-1 slice
+#   FB_SESSIONS=fb-a,fb-b ./fb-fleet
+#   DRY_RUN=1 ./fb-fleet             # print the commands only
+#
+# First-run requirements (see fleet-plan.md):
+#   * approve egress once per session binary:
+#       openshell policy update <VM> --add-endpoint freebuff.com:443 \
+#         --binary /workspace/<session>/.config/manicode/freebuff
+#   * Freebuff credentials are keyring-backed on the host, so copying
+#     credentials.json into the guest does not authenticate: each session
+#     needs one interactive device login (the link is on its hc screen).
+set -euo pipefail
+
+die() { printf 'fb-fleet: %s\n' "$*" >&2; exit 1; }
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+OSH="${OSH:-/nix/store/5wrafm7snhcsxxw5mqv2fli0l0pn3k58-openshell-0.1.5/bin/openshell}"
+HC="${HC:-/home/leo/.nix-profile/bin/hc}"
+FLEET_DIR="${FLEET_DIR:-$HOME/fleet}"
+SANDBOX_NAME="${SANDBOX_NAME:-fleet}"
+FB_SESSIONS="${FB_SESSIONS:-fb-1,fb-2,fb-3}"
+INF_SESSIONS="${INF_SESSIONS:-inf-1}"
+INFINITY_TASK="${INFINITY_TASK:-Reply with exactly: PONG. Nothing else.}"
+MANICODE_SRC="${MANICODE_SRC:-$HOME/.config/manicode}"
+INFINITY_BIN_DIR="${INFINITY_BIN_DIR:-$SCRIPT_DIR/../../infinity/target/release}"
+EDGE0_API_KEY_FILE="${EDGE0_API_KEY_FILE:-$HOME/.edge0/api-key}"
+PROVIDER="${PROVIDER:-edge0-gpu}"
+POLICY="${POLICY:-$SCRIPT_DIR/sandbox-policy.yaml}"
+
+[[ -x "$OSH" ]] || die "openshell binary missing: $OSH"
+[[ -x "$HC" ]] || die "hc binary missing: $HC"
+[[ -x "$MANICODE_SRC/freebuff" ]] || die "no native freebuff binary at $MANICODE_SRC/freebuff (run freebuff once on the host)"
+for bin in infinity infinity-provider-openai sandbox-local; do
+  [[ -x "$INFINITY_BIN_DIR/$bin" ]] || die "$INFINITY_BIN_DIR/$bin missing (cargo build --release in ../infinity)"
+done
+
+mkdir -p "$FLEET_DIR"
+
+# ── Stage per-session state on the host (workspace is the only rw share) ──
+IFS=',' read -r -a FB <<< "$FB_SESSIONS"
+IFS=',' read -r -a INF <<< "$INF_SESSIONS"
+
+for s in "${FB[@]}"; do
+  [[ "$s" =~ ^[a-zA-Z0-9_-]+$ ]] || die "bad session name: $s"
+  mkdir -p "$FLEET_DIR/$s/.config" "$FLEET_DIR/$s/repo"
+  # cp -a (not hardlinks): concurrent sessions must not share writes.
+  rm -rf "$FLEET_DIR/$s/.config/manicode"
+  cp -a "$MANICODE_SRC" "$FLEET_DIR/$s/.config/manicode"
+done
+
+# ── Bake Infinity into the Nix store (shared into the VM via /nix) ─────────
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/fb-fleet.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/infinity/bin"
+for bin in infinity infinity-provider-openai sandbox-local; do
+  cp "$INFINITY_BIN_DIR/$bin" "$STAGE/infinity/bin/$bin"
+done
+chmod 0755 "$STAGE/infinity/bin/"*
+INFINITY_STORE="$(cd "$SCRIPT_DIR" && nix store add-path "$STAGE/infinity")"
+[[ -x "$INFINITY_STORE/bin/infinity" ]] || die "store bake failed"
+
+for s in "${INF[@]}"; do
+  mkdir -p "$FLEET_DIR/$s/.infinity"
+  cat > "$FLEET_DIR/$s/.infinity/providers.json" <<EOF
+{
+  "edge0": {
+    "command": [
+      "$INFINITY_STORE/bin/infinity-provider-openai",
+      "--base-url", "http://host.openshell.internal:8001/v1",
+      "--model", "edge0_35b",
+      "--context-window", "16384"
+    ]
+  }
+}
+EOF
+  printf '{"tool_sets":[]}\n' > "$FLEET_DIR/$s/.infinity/rap.json"
+done
+
+# ── One VM: /nix ro + project dir rw ───────────────────────────────────────
+DRIVER_CONFIG="{\"vm\":{\"mounts\":[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},{\"type\":\"bind\",\"source\":\"$FLEET_DIR\",\"target\":\"/workspace\",\"read_only\":false}]}}"
+export INFINITY_OPENAI_API_KEY="$(cat "$EDGE0_API_KEY_FILE")"
+CREATE=(
+  "$OSH" sandbox create --name "$SANDBOX_NAME"
+  --driver-config-json "$DRIVER_CONFIG"
+  --policy "$POLICY"
+  --provider "$PROVIDER"
+  --env-from INFINITY_OPENAI_API_KEY
+  -- sh -c 'sleep infinity'
+)
+
+# ── One hc terminal per session, exec'ing into that VM ─────────────────────
+run_cmd() {
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    printf '%q ' "$@"; printf '\n'
+  else
+    "$@"
+  fi
+}
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf '%q ' "${CREATE[@]}"; printf '\n'
+fi
+
+# `sandbox create` waits for its command; give it a bounded wait and verify.
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  timeout 20 "${CREATE[@]}" >&2 || true
+  "$OSH" sandbox get "$SANDBOX_NAME" 2>&1 | head -c 400 >&2 || true
+fi
+
+for s in "${FB[@]}"; do
+  run_cmd "$HC" run --bg --name "$s" -- "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
+    env "HOME=/workspace/$s" "/workspace/$s/.config/manicode/freebuff"
+done
+for s in "${INF[@]}"; do
+  run_cmd "$HC" run --bg --name "$s" -- "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
+    env "HOME=/workspace/$s" "$INFINITY_STORE/bin/infinity" --initial-message "$INFINITY_TASK"
+done
+
+printf 'fb-fleet: VM %s ready; %d Freebuff + %d Infinity terminals started.\n' \
+  "$SANDBOX_NAME" "${#FB[@]}" "${#INF[@]}" >&2
