@@ -71,7 +71,7 @@ repo, which is why they are not store derivations here.
 
 ## Per-project launcher: `freebuff-here`
 
-From any project folder, run this repo's `openshell-nixos/freebuff-here`:
+From any project folder, run `fb` (short alias) or this repo's `openshell-nixos/freebuff-here`:
 
 ```sh
 cd ~/my-project

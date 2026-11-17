@@ -12,6 +12,7 @@ let
     "herdr-core-agent"
     "fb-fleet"
     "freebuff-here"
+    "fb"
     "freebuff-sandbox"
   ];
   configs = [

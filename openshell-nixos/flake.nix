@@ -80,6 +80,10 @@
           type = "app";
           program = "${self.packages.${system}.fleet}/bin/freebuff-here";
         };
+        fb = {
+          type = "app";
+          program = "${self.packages.${system}.fleet}/bin/fb";
+        };
       };
     };
 }
