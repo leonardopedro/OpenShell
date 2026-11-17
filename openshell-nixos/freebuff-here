@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# freebuff-here — run Freebuff inside the OpenShell fleet VM from the folder
+# you are currently in, and register it as a herdr-core terminal so it shows up
+# in the Android app.
+#
+#   cd ~/my-project
+#   ./freebuff-here                       # start a session named "my-project"
+#   ./freebuff-here "fix the failing test"  # also send the first task
+#   ./freebuff-here --name review2         # explicit terminal name
+#   DRY_RUN=1 ./freebuff-here             # print the commands only
+#
+# The current directory is copied into the VM's /workspace share, the Freebuff
+# native install/state is staged per session, the required egress endpoints are
+# added to the sandbox policy, and a persistent `hc` terminal is started.
+set -euo pipefail
+
+die() { printf 'freebuff-here: %s\n' "$*" >&2; exit 1; }
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+OSH="${OSH:-/nix/store/5wrafm7snhcsxxw5mqv2fli0l0pn3k58-openshell-0.1.5/bin/openshell}"
+HC="${HC:-/home/leo/.nix-profile/bin/hc}"
+HERDR_AGENT="${HERDR_AGENT:-$SCRIPT_DIR/herdr-core-agent}"
+FLEET_DIR="${FLEET_DIR:-$HOME/fleet}"
+SANDBOX_NAME="${SANDBOX_NAME:-fleet}"
+POLICY="${POLICY:-$SCRIPT_DIR/fleet-policy.yaml}"
+MANICODE_SRC="${MANICODE_SRC:-$HOME/.config/manicode}"
+
+# Hosts Freebuff actually contacts (the 35B local model needs none of these).
+HOSTS=(freebuff.com www.freebuff.com www.codebuff.com codebuff.com api.codebuff.com)
+
+[[ -x "$OSH" ]] || die "openshell binary missing: $OSH"
+[[ -x "$HC" ]] || die "hc binary missing: $HC"
+[[ -x "$HERDR_AGENT" ]] || die "herdr-core-agent missing: $HERDR_AGENT"
+[[ -f "$POLICY" ]] || die "policy file missing: $POLICY"
+[[ -x "$MANICODE_SRC/freebuff" ]] || die "no native freebuff at $MANICODE_SRC/freebuff (run freebuff once on the host)"
+
+PROJECT_DIR="$(pwd -P)"
+NAME=""
+TASK=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)
+      [[ $# -ge 2 ]] || die "--name needs a value"
+      NAME="$2"; shift 2 ;;
+    --help|-h)
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      TASK+=("$1"); shift ;;
+  esac
+done
+if [[ -z "$NAME" ]]; then
+  NAME="$(basename "$PROJECT_DIR" | tr ' ' '-' | tr -cd '[:alnum:]-_')"
+fi
+[[ -n "$NAME" ]] || die "cannot derive a session name from $PROJECT_DIR; use --name"
+
+SESSION_DIR="$FLEET_DIR/$NAME"
+BIN_GUEST="/workspace/$NAME/.config/manicode/freebuff"
+TERM_NAME="$NAME-fb"
+mkdir -p "$FLEET_DIR"
+
+# ── Stage session state (preserve an existing login) ──────────────────────
+if [[ ! -x "$SESSION_DIR/.config/manicode/freebuff" ]]; then
+  mkdir -p "$SESSION_DIR/.config"
+  cp -a "$MANICODE_SRC" "$SESSION_DIR/.config/manicode"
+fi
+if [[ "${FB_PROJECT_SYNC:-1}" != 0 ]]; then
+  mkdir -p "$SESSION_DIR/project"
+  cp -a "$PROJECT_DIR/." "$SESSION_DIR/project/"
+fi
+
+# ── Ensure the single fleet VM exists ─────────────────────────────────────
+if ! "$OSH" sandbox get "$SANDBOX_NAME" >/dev/null 2>&1; then
+  DRIVER="{\"vm\":{\"mounts\":[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},{\"type\":\"bind\",\"source\":\"$FLEET_DIR\",\"target\":\"/workspace\",\"read_only\":false}]}}"
+  echo "Creating sandbox $SANDBOX_NAME with /nix + /workspace mounts..." >&2
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    printf '%q ' "$OSH" sandbox create --name "$SANDBOX_NAME" --driver-config-json "$DRIVER" --policy "$POLICY" -- sh -c 'sleep infinity'; printf '\n'
+  else
+    timeout 25 "$OSH" sandbox create --name "$SANDBOX_NAME" \
+      --driver-config-json "$DRIVER" --policy "$POLICY" \
+      -- sh -c 'sleep infinity' >&2 || true
+  fi
+fi
+
+# ── Allow this session's binary to reach Freebuff/Codebuff ────────────────
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+  for h in "${HOSTS[@]}"; do
+    "$OSH" policy update "$SANDBOX_NAME" --add-endpoint "$h:443" --binary "$BIN_GUEST" >&2
+  done
+else
+  for h in "${HOSTS[@]}"; do
+    printf '%q ' "$OSH" policy update "$SANDBOX_NAME" --add-endpoint "$h:443" --binary "$BIN_GUEST"; printf '\n'
+  done
+fi
+
+# ── Start the hc terminal (coarse idle/done status via OSC 7501) ──────────
+RUN=(
+  "$HC" run --bg --name "$TERM_NAME" --
+  "$HERDR_AGENT" __runner "$TERM_NAME"
+  "$OSH" sandbox exec --tty "$SANDBOX_NAME" --
+  env "HOME=/workspace/$NAME"
+  /bin/sh -c "cd /workspace/$NAME/project && exec $BIN_GUEST"
+)
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf '%q ' "${RUN[@]}"; printf '\n'
+else
+  "${RUN[@]}" >&2
+  if [[ ${#TASK[@]} -gt 0 ]]; then
+    sleep 6
+    "$HC" send "$TERM_NAME" "${TASK[*]}" >&2
+  fi
+fi
+
+printf 'freebuff-here: terminal %s started in sandbox %s (folder %s).\n' \
+  "$TERM_NAME" "$SANDBOX_NAME" "$PROJECT_DIR" >&2
+printf '  hc attach %s          # Ctrl-\\ detaches; Herdr Mobile shows it too\n' "$TERM_NAME" >&2
+printf '  if the CLI asks to login, approve the link promptly (codes expire).\n' >&2
