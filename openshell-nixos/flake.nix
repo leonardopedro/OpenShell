@@ -54,7 +54,17 @@
         herdr-core = pkgs.callPackage ./herdr-core-package.nix { };
         herdr = pkgs.herdr;
 
-        default = self.packages.${system}.openshell;
+        # Everything needed to drive the fleet from a project folder. Freebuff
+        # and the Infinity --release binaries stay external: Freebuff's native
+        # binary/credentials live in ~/.config/manicode, and Infinity is baked
+        # into the shared store by infinity-sandbox at launch time.
+        fleet = pkgs.callPackage ./fleet-package.nix {
+          openshell = self.packages.${system}.openshell;
+          herdr-core = self.packages.${system}.herdr-core;
+          herdr = self.packages.${system}.herdr;
+        };
+
+        default = self.packages.${system}.fleet;
       };
 
       apps.${system} = {
@@ -65,6 +75,10 @@
         hc = {
           type = "app";
           program = "${self.packages.${system}.herdr-core}/bin/hc";
+        };
+        freebuff-here = {
+          type = "app";
+          program = "${self.packages.${system}.fleet}/bin/freebuff-here";
         };
       };
     };

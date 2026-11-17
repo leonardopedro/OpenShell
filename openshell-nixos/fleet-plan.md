@@ -45,6 +45,30 @@ Per laptop:  1 OpenShell VM (libkrun + DAX: /nix ro, /workspace rw)
    ```
    Import `providers/edge0-openai-gpu.yaml` and create provider `edge0-gpu`.
 
+## Install as one Nix package
+
+From this directory:
+
+```sh
+nix profile install path:$PWD#fleet
+```
+
+The `fleet` package installs the launchers (`freebuff-here`, `fb-fleet`,
+`infinity-sandbox`, `herdr-core-agent`, `freebuff-sandbox`), the sandbox/provider
+policies and herdr-core config beside them, plus the docs in
+`share/doc/agent-fleet`. It also brings OpenShell, herdr-core and the Herdr TUI
+onto `PATH` (the launchers are wrapped with those paths, so `nix run` works too):
+
+```sh
+nix run path:$PWD#freebuff-here -- --help
+```
+
+Freebuff and the Infinity `--release` binaries stay external by design: Freebuff's
+native binary and live credentials live in `~/.config/manicode` and are staged
+per session; Infinity is baked into the shared Nix store at launch time by
+`infinity-sandbox`. A pure flake cannot reference a local build tree outside the
+repo, which is why they are not store derivations here.
+
 ## Per-project launcher: `freebuff-here`
 
 From any project folder, run this repo's `openshell-nixos/freebuff-here`:
