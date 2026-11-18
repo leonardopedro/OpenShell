@@ -12,7 +12,7 @@ Install OpenShell on a local workstation or Kubernetes.
 
 ## Install OpenShell
 
-Install the CLI, policy prover, and a local gateway with one command:
+On Linux or macOS, install the CLI, policy prover, and a local gateway with one command:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
@@ -72,6 +72,21 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 | Docker | Docker Desktop or Docker Engine 28.0 or later. |
 | Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
 | MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
+| [Windows MXC](#windows) | Native Windows x64 or ARM64 with MXC 1.0.0 and a host that passes the ProcessContainer capability probe. Development; not production-qualified. |
+
+## Windows
+
+Build native Windows x64 or ARM64 binaries from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Follow the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for MSVC prerequisites, MXC host probing, and gateway setup. Select
+`compute_driver = "mxc"` in the gateway TOML file.
+
+Native Windows uses Microsoft MXC ProcessContainer isolation. It is under
+development and is not production-qualified; see the
+[current runtime limitations](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits).
+The installer and release channels above do not supply native Windows binaries.
+Running Linux OpenShell inside WSL 2 is a separate, experimental option.
 
 ## macOS
 
@@ -115,6 +130,60 @@ To keep the gateway running after you log out, enable linger:
 
 ```shell
 sudo loginctl enable-linger $USER
+```
+
+### Chutes edge
+
+Both packages also install `openshell-chutes-edge`, which terminates Chutes
+end-to-end encryption in front of the gateway. Unlike the gateway it runs as a
+system service (`openshell-chutes-edge.service`), because it serves one shared
+upstream key instead of a single user's containers. The package installs the
+unit but does not create its key file or start the service.
+
+Write the key file first. It is read as a systemd `EnvironmentFile`, so use
+`KEY=value` lines:
+
+```shell
+sudo install -d -m 0755 /etc/openshell
+sudo sh -c 'umask 077 && : >/etc/openshell/chutes-edge.env'
+sudoedit /etc/openshell/chutes-edge.env
+```
+
+At minimum:
+
+```shell
+CHUTES_API_KEY=<your-chutes-api-key>
+```
+
+These optional variables change its behavior: `CHUTES_EDGE_LISTEN` (default
+`127.0.0.1:8090`; set it to `0.0.0.0:8090` only if the edge must accept traffic
+from other hosts), `CHUTES_API_BASE`, `CHUTES_LLM_BASE`, `CHUTES_E2E_INVOKE`,
+`CHUTES_TIMEOUT_SECS`, `CHUTES_TLS_SPKI_PINS`, and `CHUTES_PROXY`.
+
+Keep the file `0600` and root-owned. systemd reads environment files itself, so
+the service's ephemeral user never opens this file and does not need access to
+it:
+
+```shell
+sudo chown root:root /etc/openshell/chutes-edge.env
+sudo chmod 0600 /etc/openshell/chutes-edge.env
+sudo systemctl enable --now openshell-chutes-edge
+systemctl status openshell-chutes-edge
+journalctl -u openshell-chutes-edge -f
+```
+
+Restart the service after editing the file:
+
+```shell
+sudo systemctl restart openshell-chutes-edge
+```
+
+Requests use the same Chutes routes as the gateway, prefixed with `/v1/chutes`.
+With the default listen address, confirm the edge can reach Chutes:
+
+```shell
+curl -sS http://127.0.0.1:8090/v1/chutes/models \
+  -H "Authorization: Bearer $CHUTES_API_KEY"
 ```
 
 ## Snap

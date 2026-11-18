@@ -125,6 +125,40 @@ the sandbox: the launcher stages your host's `~/.config/manicode` into
 the workspace share (the hardlink farm above) and aborts up front, with
 instructions, if the host binary is missing.
 
+## Run Infinity instead (cloud-hypervisor backend)
+
+`./infinity-sandbox` runs Infinity Code as the sandbox workload on the fork's
+cloud-hypervisor backend, with the binaries baked in through the shared Nix
+store instead of uploaded into the guest: `nix store add-path` puts
+`infinity` / `infinity-provider-openai` / `sandbox-local` in `/nix/store`, the
+`/nix` mount makes that the guest's own store, and `~/.infinity` is staged into
+`$PROJECTS_DIR/.infinity-home` as the guest's `HOME`. No image rebuild and no
+upload per sandbox; upgrading is one rebuild plus one launcher run.
+
+```sh
+PROJECTS_DIR=~/code ./infinity-sandbox
+```
+
+With `SANDBOX_GPU=1` it targets the host's GPU instead: the Vulkan server on
+`:8001` and the `edge0-gpu` provider profile, with host-side checks for the
+card, the server's `--device vulkan` flag and the endpoint. The GPU stays on
+the host (the guest image has no NVIDIA userspace); see the GPU profile section
+of [infinity-sandbox.md](infinity-sandbox.md).
+
+It expects `edge0-infer serve` on the host at `:8000` with an API key in
+`~/.edge0/api-key`, the `edge0-openai` provider profile imported, and the VM
+driver's cloud-hypervisor VMM + kernel configured (`OPENSHELL_VM_CH_PATH`,
+`OPENSHELL_VM_CH_KERNEL`). Prerequisites, the kernel download, the mount and
+policy layout, and troubleshooting are in
+[infinity-sandbox.md](infinity-sandbox.md).
+
+To control those agents from a phone or another laptop, this folder also
+packages **herdr-core** (`hc`, the runtime behind the Herdr mobile app) and
+provides `herdr-core-agent`, which runs an Infinity sandbox as a persistent
+`hc` terminal reachable over SSH. See
+[herdr-core.md](herdr-core.md) for the Nix install, core config and phone
+setup.
+
 ## Security decisions (read before weakening)
 
 * **`/nix` is read-only.** `SHARE_NIX_RW=1` flips it (and the config's

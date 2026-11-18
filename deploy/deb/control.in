@@ -10,8 +10,12 @@ Description: Safe, sandboxed runtimes for autonomous AI agents
  OpenShell provides host-side command-line and gateway components for
  launching and managing policy-enforced AI agent sandboxes. The package
  installs the openshell CLI, standalone policy prover, openshell-gateway daemon,
- and the VM compute driver helper, plus a per-user systemd unit for running the
- gateway.
+ the VM compute driver helper, and the openshell-chutes-edge frontend, plus
+ systemd units for running the gateway and the edge.
  .
- The systemd unit is user-scope (under /usr/lib/systemd/user/). To start
+ The gateway unit is user-scope (under /usr/lib/systemd/user/). To start
  it, run `systemctl --user enable --now openshell-gateway`.
+ .
+ The edge unit is system-scope and reads its Chutes API key from
+ /etc/openshell/chutes-edge.env. After writing that file, run
+ `systemctl enable --now openshell-chutes-edge`.

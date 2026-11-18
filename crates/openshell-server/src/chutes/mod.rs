@@ -26,16 +26,22 @@
 //! | `CHUTES_LLM_BASE` | `https://llm.chutes.ai/v1` |
 //! | `CHUTES_E2E_INVOKE` | `https://api.chutes.ai/e2e/invoke` |
 //! | `CHUTES_TIMEOUT_SECS` | `600` |
+//! | `CHUTES_TLS_SPKI_PINS` | — (base64 SHA-256 SPKI pins for the upstream chain) |
+//! | `CHUTES_PROXY` | `none` (`env` honours `HTTP(S)_PROXY`, or a proxy URL) |
 //!
 //! Auth: callers present their own Chutes key as
 //! `Authorization: Bearer <key>`; the environment key is only a fallback
 //! for deployments where the gateway holds a shared key.
 
+pub mod api;
 mod client;
 pub mod e2ee;
-mod stream;
+pub mod stream;
+mod tls;
 #[cfg(test)]
 mod tests;
+
+pub use client::ChutesClient;
 
 use std::sync::Arc;
 
@@ -47,18 +53,39 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::{Value, json};
-use tracing::debug;
-
-use client::{ChutesClient, ChutesError, InvokeOutcome};
-use stream::{accumulate_completion, decrypt_blob, decrypted_stream_body};
+use stream::decrypted_stream_body;
 
 const DEFAULT_API_BASE: &str = "https://api.chutes.ai";
 const DEFAULT_LLM_BASE: &str = "https://llm.chutes.ai/v1";
 const DEFAULT_E2E_INVOKE: &str = "https://api.chutes.ai/e2e/invoke";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
-const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
+/// How the upstream client treats proxies.
+///
+/// `None` is the default: the E2EE hop should not be silently routed through
+/// whatever proxy the process environment happens to describe. Operators opt
+/// in explicitly, either by pointing at a proxy URL or by saying they want
+/// the environment honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyPolicy {
+    /// Ignore proxy environment variables entirely.
+    None,
+    /// Honour `HTTP(S)_PROXY` / `NO_PROXY` like a generic HTTP client.
+    Environment,
+    /// Send every upstream request through this proxy URL.
+    Url(String),
+}
+
+impl ProxyPolicy {
+    /// Parse a `CHUTES_PROXY` value: `none`/unset, `env`, or a proxy URL.
+    pub(crate) fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("" | "none") => Self::None,
+            Some("env" | "environment") => Self::Environment,
+            Some(url) => Self::Url(url.to_string()),
+        }
+    }
+}
 
 /// Upstream endpoints and fallbacks for the Chutes proxy.
 #[derive(Debug, Clone)]
@@ -73,6 +100,11 @@ pub struct ChutesConfig {
     pub timeout_secs: u64,
     /// API key used when the caller sends no `Authorization` header.
     pub default_api_key: Option<String>,
+    /// Accepted leaf `SubjectPublicKeyInfo` pins for the upstream TLS chain.
+    /// Empty means "trust the platform roots" (the default).
+    pub tls_spki_pins: Vec<tls::SpkiPin>,
+    /// Proxy policy for upstream requests.
+    pub proxy: ProxyPolicy,
 }
 
 impl Default for ChutesConfig {
@@ -83,8 +115,25 @@ impl Default for ChutesConfig {
             e2e_invoke: DEFAULT_E2E_INVOKE.to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             default_api_key: None,
+            tls_spki_pins: Vec::new(),
+            proxy: ProxyPolicy::None,
         }
     }
+}
+
+/// Parse `CHUTES_TLS_SPKI_PINS` (comma-separated base64 SHA-256 digests).
+///
+/// A malformed pin is a startup configuration error: silently trusting the
+/// platform roots instead would defeat the point of configuring pins.
+fn parse_spki_pins(raw: &str) -> Vec<tls::SpkiPin> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            tls::decode_pin(entry)
+                .unwrap_or_else(|error| panic!("invalid CHUTES_TLS_SPKI_PINS entry: {error}"))
+        })
+        .collect()
 }
 
 impl ChutesConfig {
@@ -102,6 +151,9 @@ impl ChutesConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
             default_api_key: env("CHUTES_API_KEY"),
+            tls_spki_pins: env("CHUTES_TLS_SPKI_PINS")
+                .map_or_else(Vec::new, |raw| parse_spki_pins(&raw)),
+            proxy: ProxyPolicy::parse(env("CHUTES_PROXY").as_deref()),
         }
     }
 }
@@ -148,15 +200,36 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({"error": {"message": message, "type": "chutes_proxy_error"}})),
-    )
-        .into_response()
+fn status_code(code: u16) -> StatusCode {
+    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
-const MISSING_KEY_MESSAGE: &str = "missing Chutes API key: send `Authorization: Bearer <CHUTES_API_KEY>` or configure CHUTES_API_KEY on the gateway";
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (status, Json(api::error_body(message))).into_response()
+}
+
+fn render_buffered(reply: api::BufferedReply) -> Response {
+    match reply {
+        api::BufferedReply::Body {
+            status,
+            body,
+            content_type,
+        } => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status_code(status);
+            if let Some(value) = content_type
+                .as_deref()
+                .and_then(|ct| HeaderValue::from_str(ct).ok())
+            {
+                response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            response
+        }
+        api::BufferedReply::Error(error) => {
+            (status_code(error.status), Json(error.value)).into_response()
+        }
+    }
+}
 
 /// The caller's Chutes key: bearer header first, environment fallback second.
 fn caller_api_key(state: &ChutesState, headers: &HeaderMap) -> Option<String> {
@@ -167,136 +240,39 @@ fn caller_api_key(state: &ChutesState, headers: &HeaderMap) -> Option<String> {
 async fn chat_completions(
     State(state): State<ChutesState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let Some(api_key) = caller_api_key(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, MISSING_KEY_MESSAGE);
+        return error_response(StatusCode::UNAUTHORIZED, api::MISSING_KEY_MESSAGE);
     };
 
-    if !payload.is_object() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "request body must be a JSON object",
-        );
-    }
-    let Some(model) = payload.get("model").and_then(Value::as_str) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "request body must include a string `model` field",
-        );
-    };
-    let model = model.to_string();
-    let client_stream = payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    // The protocol always rides on an upstream SSE stream; clients that
-    // asked for `stream: false` get the stream accumulated back into one
-    // `chat.completion` object (matches the live-tested claurst behavior).
-    let mut outbound = payload.clone();
-    outbound["model"] = Value::String(model.strip_prefix("chutes/").unwrap_or(&model).to_string());
-    outbound["stream"] = Value::Bool(true);
-    let outbound_json = outbound.to_string();
-
-    debug!(model = %model, client_stream, "chutes e2ee invoke");
-    match state.client.invoke(&model, &outbound_json, &api_key).await {
-        Ok(outcome) => render_upstream(outcome, client_stream, &model).await,
-        Err(error) => map_error(error),
-    }
-}
-
-/// Turn a successful upstream invoke into the client-facing response.
-async fn render_upstream(
-    outcome: InvokeOutcome,
-    client_stream: bool,
-    request_model: &str,
-) -> Response {
-    let InvokeOutcome { session, response } = outcome;
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let is_sse = content_type
-        .as_deref()
-        .is_some_and(|ct| ct.contains("text/event-stream"));
-
-    if is_sse {
-        if client_stream {
+    match api::chat(&state.client, &api_key, &payload).await {
+        api::ChatOutcome::Stream(stream) => {
+            let api::ChatStream {
+                status,
+                session,
+                response,
+            } = *stream;
             let mut response = Response::new(decrypted_stream_body(session, response));
-            *response.status_mut() = status;
+            *response.status_mut() = status_code(status);
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
-                SSE_CONTENT_TYPE.parse().expect("static header"),
+                HeaderValue::from_static(api::SSE_CONTENT_TYPE),
             );
-            return response;
-        }
-        return match accumulate_completion(session, response, request_model).await {
-            Ok(completion) => (status, Json(completion)).into_response(),
-            Err(error) => error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("e2ee stream accumulation failed: {error}"),
-            ),
-        };
-    }
-
-    // Non-SSE 2xx: either a plaintext JSON body (passthrough) or an
-    // encrypted response blob.
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("failed reading upstream response: {error}"),
-            );
-        }
-    };
-    let opened = serde_json::from_slice::<Value>(&bytes)
-        .map_err(|e| format!("not plaintext JSON: {e}"))
-        .or_else(|_| decrypt_blob(&session, &bytes).map_err(|e| e.to_string()));
-    match opened {
-        Ok(value) if client_stream => sse_single_event(value, status),
-        Ok(value) => (status, Json(value)).into_response(),
-        Err(error) => error_response(
-            StatusCode::BAD_GATEWAY,
-            &format!("failed opening upstream response: {error}"),
-        ),
-    }
-}
-
-/// Render one JSON value as a single-event SSE stream for a client that
-/// requested `stream: true` but received a non-SSE upstream body.
-fn sse_single_event(value: Value, status: StatusCode) -> Response {
-    let body = format!("data: {value}\n\ndata: [DONE]\n\n");
-    (status, [(header::CONTENT_TYPE, SSE_CONTENT_TYPE)], body).into_response()
-}
-
-/// Map client/upstream errors onto a response, forwarding upstream
-/// non-2xx statuses and bodies verbatim.
-fn map_error(error: ChutesError) -> Response {
-    match error {
-        ChutesError::Upstream {
-            status,
-            body,
-            content_type,
-        } => {
-            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut response = Response::new(Body::from(body));
-            *response.status_mut() = status;
-            if let Some(value) = content_type
-                .as_deref()
-                .and_then(|ct| HeaderValue::from_str(ct).ok())
-            {
-                response.headers_mut().insert(header::CONTENT_TYPE, value);
-            }
             response
         }
-        other => {
-            tracing::error!(error = %other, "chutes upstream request failed");
-            error_response(StatusCode::BAD_GATEWAY, &other.to_string())
+        api::ChatOutcome::Json { status, value } => {
+            (status_code(status), Json(value)).into_response()
+        }
+        api::ChatOutcome::Sse { status, text } => (
+            status_code(status),
+            [(header::CONTENT_TYPE, HeaderValue::from_static(api::SSE_CONTENT_TYPE))],
+            text,
+        )
+            .into_response(),
+        api::ChatOutcome::Buffered(reply) => render_buffered(reply),
+        api::ChatOutcome::Error(error) => {
+            (status_code(error.status), Json(error.value)).into_response()
         }
     }
 }
@@ -308,34 +284,8 @@ async fn models(
     request: Request,
 ) -> Response {
     let Some(api_key) = caller_api_key(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, MISSING_KEY_MESSAGE);
+        return error_response(StatusCode::UNAUTHORIZED, api::MISSING_KEY_MESSAGE);
     };
-    let query = request.uri().query();
-    match state.client.get_models(&api_key, query).await {
-        Ok(upstream) => {
-            let status =
-                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let content_type = upstream
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-            let body = match upstream.bytes().await {
-                Ok(bytes) => Body::from(bytes),
-                Err(error) => {
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("failed reading upstream response: {error}"),
-                    );
-                }
-            };
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
-            response
-        }
-        Err(error) => map_error(error),
-    }
+    let query = request.uri().query().map(str::to_owned);
+    render_buffered(api::models(&state.client, &api_key, query.as_deref()).await)
 }

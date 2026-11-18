@@ -517,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn filesystem_preflight_stops_a_hung_version_probe() {
         let temp = tempfile::tempdir().expect("hung installation");
-        fake_e2fs_tool(temp.path(), "mke2fs", "exec /bin/sleep 30");
+        fake_e2fs_tool(temp.path(), "mke2fs", "exec sleep 30");
         let error = preflight_in(&[temp.path().to_path_buf()])
             .await
             .expect_err("preflight must finish even if a tool hangs");
@@ -531,7 +531,7 @@ mod tests {
             fake_e2fs_tool(
                 temp.path(),
                 "mke2fs",
-                &format!("/bin/dd if=/dev/zero bs=16384 count=4 {redirect} 2>/dev/null\nexit 42"),
+                &format!("dd if=/dev/zero bs=16384 count=4 {redirect} 2>/dev/null\nexit 42"),
             );
             let error = preflight_in(&[temp.path().to_path_buf()])
                 .await
@@ -553,7 +553,7 @@ mod tests {
             temp.path(),
             "mke2fs",
             &format!(
-                "(/bin/sleep 6; echo survived > '{}') &\nwait",
+                "(sleep 6; echo survived > '{}') &\nwait",
                 marker.display()
             ),
         );
@@ -576,7 +576,7 @@ mod tests {
             temp.path(),
             "mke2fs",
             &format!(
-                "(/bin/sleep 6; echo survived > '{}') &\necho 'mke2fs 1.47.4'\nexit 0",
+                "(sleep 6; echo survived > '{}') &\necho 'mke2fs 1.47.4'\nexit 0",
                 marker.display()
             ),
         );
@@ -600,7 +600,7 @@ mod tests {
             temp.path(),
             "mke2fs",
             &format!(
-                "(echo ready > '{}'; /bin/sleep 6; echo survived > '{}') &\nwait",
+                "(echo ready > '{}'; sleep 6; echo survived > '{}') &\nwait",
                 ready.display(),
                 marker.display()
             ),

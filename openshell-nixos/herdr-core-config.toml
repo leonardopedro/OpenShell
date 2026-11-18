@@ -1,0 +1,24 @@
+# herdr-core config template for the agent fleet host.
+#
+# Install with:
+#   install -Dm600 herdr-core-config.toml ~/.config/herdr-core/config.toml
+#
+# Keys are from `hc --help`, herdr-core's README and its config reference.
+# A bad key is logged to core.log and ignored, so edit carefully.
+
+# Don't have the core type notes into parent terminals: the Infinity TUI owns
+# its screen, and injected text would corrupt its rendering.
+notes = false
+
+# Show the last saved screen above a recovered shell if a program is lost.
+restore_screen = true
+
+# Seconds of quiet before a note is sent to a parent terminal.
+notes_quiet = 3
+
+# Seconds an unfinished draft holds sends and notes; 0 keeps only the quiet pause.
+draft_wait = 60
+
+# The core's own shell for new terminals. The Infinity agents are explicit
+# programs (see herdr-core-agent), so this is only used for plain terminals.
+# shell = ["/bin/bash", "-l"]

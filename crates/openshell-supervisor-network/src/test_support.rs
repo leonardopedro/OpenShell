@@ -1,7 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Executable identity and socket-owner subprocess fixtures.
+//! Credential, executable identity, and socket-owner subprocess fixtures.
+
+pub fn header_placement_metadata(
+    keys: &[&str],
+) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
+    keys.iter()
+        .map(|key| {
+            (
+                format!(
+                    "{}{key}",
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ),
+                openshell_core::proto::ProviderProfileCredential {
+                    env_vars: vec![(*key).to_string()],
+                    auth_style: "bearer".to_string(),
+                    header_name: "Authorization".to_string(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
 
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
@@ -9,6 +30,17 @@ use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
+
+/// Resolve a host tool through `PATH` instead of assuming an FHS layout.
+/// NixOS has no `/bin/sleep` or `/bin/bash`; an unguarded fixture either
+/// panics or silently skips.
+#[cfg(target_os = "linux")]
+pub fn host_tool(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
 
 #[cfg(target_os = "linux")]
 pub struct SocketHolder(pub Child);
@@ -26,7 +58,8 @@ impl Drop for SocketHolder {
 #[cfg(target_os = "linux")]
 pub fn spawn_socket_holder(stream: &TcpStream, exec_sleep: bool) -> SocketHolder {
     let mut command = if exec_sleep {
-        let mut command = Command::new("/bin/sleep");
+        let sleep = host_tool("sleep").expect("sleep on PATH");
+        let mut command = Command::new(sleep);
         command.arg("30");
         command
     } else {

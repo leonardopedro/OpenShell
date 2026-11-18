@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The GNU-linked chutes edge binary is staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-chutes-edge
+#
+# Distroless Debian provides the glibc runtime required by the binary.
+#
+# The edge needs an upstream key: pass CHUTES_API_KEY at run time (callers may
+# still override it with their own `Authorization: Bearer` header). All other
+# CHUTES_* configuration is optional; see crates/openshell-chutes-edge.
+
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM ${GATEWAY_BASE_IMAGE} AS chutes-edge
+
+ARG TARGETARCH
+
+WORKDIR /app
+
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-chutes-edge /usr/local/bin/openshell-chutes-edge
+
+ENV CHUTES_EDGE_LISTEN=0.0.0.0:8090
+
+USER 1000:1000
+EXPOSE 8090
+
+ENTRYPOINT ["/usr/local/bin/openshell-chutes-edge"]
