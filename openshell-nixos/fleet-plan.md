@@ -45,6 +45,48 @@ Per laptop:  1 OpenShell VM (libkrun + DAX: /nix ro, /workspace rw)
    ```
    Import `providers/edge0-openai-gpu.yaml` and create provider `edge0-gpu`.
 
+## Install as one Nix package
+
+From this directory:
+
+```sh
+nix profile install path:$PWD#fleet
+```
+
+The `fleet` package installs the launchers (`freebuff-here`, `fb-fleet`,
+`infinity-sandbox`, `herdr-core-agent`, `freebuff-sandbox`), the sandbox/provider
+policies and herdr-core config beside them, plus the docs in
+`share/doc/agent-fleet`. It also brings OpenShell, herdr-core and the Herdr TUI
+onto `PATH` (the launchers are wrapped with those paths, so `nix run` works too):
+
+```sh
+nix run path:$PWD#freebuff-here -- --help
+```
+
+Freebuff and the Infinity `--release` binaries stay external by design: Freebuff's
+native binary and live credentials live in `~/.config/manicode` and are staged
+per session; Infinity is baked into the shared Nix store at launch time by
+`infinity-sandbox`. A pure flake cannot reference a local build tree outside the
+repo, which is why they are not store derivations here.
+
+## Per-project launcher: `freebuff-here`
+
+From any project folder, run `fb` (short alias) or this repo's `openshell-nixos/freebuff-here`:
+
+```sh
+cd ~/my-project
+../OpenShell/openshell-nixos/freebuff-here                 # session named after the folder
+../OpenShell/openshell-nixos/freebuff-here "fix the test"  # also sends the first task
+DRY_RUN=1 ../OpenShell/openshell-nixos/freebuff-here       # print commands only
+```
+
+It copies the current directory into the fleet VM's `/workspace/<name>/project`,
+stages a per-session Freebuff state dir, adds the five egress endpoints for that
+session's binary, and starts an `hc` terminal named `<folder>-fb`. The terminal
+appears in Herdr Mobile automatically. `FLEET_DIR` and `SANDBOX_NAME` override
+the shared workspace and VM. A new session needs one device login (codes expire
+in ~10 minutes); existing sessions keep their staged login.
+
 ## One VM, many sessions
 
 A sandbox is a VM with an exec channel. Keep one VM alive per laptop and open one `hc` terminal per session into it:

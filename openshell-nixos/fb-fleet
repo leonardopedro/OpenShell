@@ -22,8 +22,11 @@ set -euo pipefail
 die() { printf 'fb-fleet: %s\n' "$*" >&2; exit 1; }
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-OSH="${OSH:-/nix/store/5wrafm7snhcsxxw5mqv2fli0l0pn3k58-openshell-0.1.5/bin/openshell}"
-HC="${HC:-/home/leo/.nix-profile/bin/hc}"
+resolve_bin() {
+  if [[ "$1" == */* ]]; then printf '%s' "$1"; else command -v "$1" || true; fi
+}
+OSH="$(resolve_bin "${OSH:-openshell}")"
+HC="$(resolve_bin "${HC:-hc}")"
 FLEET_DIR="${FLEET_DIR:-$HOME/fleet}"
 SANDBOX_NAME="${SANDBOX_NAME:-fleet}"
 FB_SESSIONS="${FB_SESSIONS:-fb-1,fb-2,fb-3}"

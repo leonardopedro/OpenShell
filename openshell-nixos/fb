@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# fb — short alias for freebuff-here: run Freebuff in OpenShell from the
+# current folder, with the session registered in herdr-core.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/freebuff-here" "$@"
