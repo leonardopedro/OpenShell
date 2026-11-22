@@ -13,6 +13,7 @@ Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
 For newly opened PRs, --label-accepted-work also adds state:accepted if qualified.
 Request all matching roster members, excluding the author. Preserve
 manual choices, unknown request provenance, and anyone who commented or reviewed.
+A failed reviewer request or removal is noted on the PR and does not fail the run.
 The parser and planning helpers are importable. No state is stored between runs.
 """
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -27,11 +29,106 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from check_maintainer_approval import parse_maintainers
-from label_accepted_work import ACCEPTED_LABEL, check_pr_accepted_work
+from label_accepted_work import ACCEPTED_LABEL, evaluate_pr_accepted_work
 
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
 LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
+ASSIGNMENT_MARKER = "<!-- openshell-review-readiness:assignment-failure -->"
+ADD_LABEL = """mutation($input: AddLabelsToLabelableInput!) {
+  addLabelsToLabelable(input: $input) { labelable { __typename } }
+}"""
+
+
+class LabelRoutingError(ValueError):
+    """The PR's area or topic labels prevent requesting reviewers."""
+
+
+class MaintainerEditsError(ValueError):
+    """A ready PR from a personal fork does not allow edits by maintainers."""
+
+
+def needs_maintainer_edits(pr: dict, repository: str) -> bool:
+    """Whether a ready PR must allow maintainer edits but does not.
+
+    GitHub only offers the setting on PRs from personal forks, so PRs from
+    branches in the target repository and from organization-owned forks are
+    exempt, as are PRs whose fork was deleted.
+    """
+    head_repo = (pr.get("head") or {}).get("repo")
+    if pr["draft"] or not head_repo or head_repo.get("full_name") == repository:
+        return False
+    if (head_repo.get("owner") or {}).get("type") == "Organization":
+        return False
+    return not pr.get("maintainer_can_modify")
+
+
+def _api_action(method: str, path: str) -> str:
+    """Name the step a failed `gh api` call was performing."""
+    if path.endswith("/requested_reviewers"):
+        return (
+            "Removing reviewer requests"
+            if method == "DELETE"
+            else "Requesting reviewers"
+        )
+    if path.endswith("/labels") and method == "POST":
+        return "Adding labels"
+    if "/comments" in path and method in {"POST", "PATCH"}:
+        return "Commenting on the PR"
+    if method == "GET":
+        return "Reading the PR from GitHub"
+    return "A GitHub API call"
+
+
+def _escape_annotation(text: str, *, prop: bool = False) -> str:
+    """Escape text for a GitHub Actions workflow command."""
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if prop:
+        text = text.replace(":", "%3A").replace(",", "%2C")
+    return text
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """Return a short category and an actionable message for a failure."""
+    if isinstance(exc, LabelRoutingError):
+        return "PR labels", str(exc)
+    if isinstance(exc, MaintainerEditsError):
+        return "Maintainer edits", str(exc)
+    if isinstance(exc, subprocess.CalledProcessError):
+        command = [str(part) for part in exc.cmd]
+        method = "GET"
+        if "--method" in command[:-1]:
+            method = command[command.index("--method") + 1]
+        path = command[2] if len(command) > 2 else ""
+        message = (
+            f"{_api_action(method, path)} failed with a GitHub API error: "
+            f"gh api {method} {path}"
+        )
+        detail = (exc.stderr or "").strip()
+        if detail:
+            message += f": {detail}"
+        message += f" (exit status {exc.returncode})"
+        return "GitHub API error", message
+    return "error", str(exc)
+
+
+def _report(level: str, category: str, message: str, *, stream=None, env=None) -> None:
+    stream = sys.stderr if stream is None else stream
+    env = os.environ if env is None else env
+    print(f"Review readiness: {message}", file=stream)
+    if env.get("GITHUB_ACTIONS") == "true":
+        title = _escape_annotation(f"Review Readiness: {category}", prop=True)
+        print(f"::{level} title={title}::{_escape_annotation(message)}", file=stream)
+
+
+def report_failure(exc: Exception, *, stream=None, env=None) -> None:
+    """Print the failure, plus an Actions error annotation when in Actions."""
+    _report("error", *describe_failure(exc), stream=stream, env=env)
+
+
+def report_assignment_failure(message: str, *, stream=None, env=None) -> None:
+    """Print a reviewer assignment failure as a warning that passes the check."""
+    _report("warning", "reviewer assignment", message, stream=stream, env=env)
 
 
 @dataclass(frozen=True)
@@ -40,6 +137,7 @@ class ReviewPlan:
     remove: tuple[str, ...]
     accepted_work: bool | None = None
     add_labels: tuple[str, ...] = ()
+    assignment_error: str = ""
 
 
 def parse_reviewers(markdown: str) -> dict[str, set[str]]:
@@ -91,11 +189,27 @@ def parse_reviewers(markdown: str) -> dict[str, set[str]]:
 def select_reviewers(categories: dict[str, set[str]], labels: set[str]) -> set[str]:
     """Return matching handles for one primary area and any number of topics."""
     relevant = {label for label in labels if label.startswith(("area:", "topic:"))}
-    if sum(label.startswith("area:") for label in relevant) != 1:
-        raise ValueError("a ready PR must have exactly one area label")
+    areas = sorted(label for label in relevant if label.startswith("area:"))
+    if not areas:
+        raise LabelRoutingError(
+            "This PR has no area label. A ready PR needs exactly one; add one."
+        )
+    if len(areas) > 1:
+        raise LabelRoutingError(
+            f"This PR has more than one area label: {', '.join(areas)}. "
+            "A ready PR needs exactly one; remove the others."
+        )
     unknown = relevant - categories.keys()
     if unknown:
-        raise ValueError("unknown area/topic labels: " + ", ".join(sorted(unknown)))
+        names = ", ".join(sorted(unknown))
+        if len(unknown) == 1:
+            raise LabelRoutingError(
+                f"There is an invalid area or topic label on this PR: {names}. "
+                "Remove it."
+            )
+        raise LabelRoutingError(
+            f"There are invalid area and topic labels on this PR: {names}. Remove them."
+        )
     return set().union(*(categories[label] for label in relevant))
 
 
@@ -212,6 +326,87 @@ def _routing_key(pr: dict):
     )
 
 
+def _add_accepted_label(repository: str, pr: dict, evidence: dict) -> None:
+    label = _api(f"repos/{repository}/labels/state%3Aaccepted")
+    rationale = json.dumps(
+        {"schema": "openshell-acceptance-v1", **evidence}, separators=(",", ":")
+    )
+    result = _api(
+        "graphql",
+        method="POST",
+        data={
+            "query": ADD_LABEL,
+            "variables": {
+                "input": {
+                    "labelableId": pr["node_id"],
+                    "labels": [{"labelId": label["node_id"], "rationale": rationale}],
+                }
+            },
+        },
+    )
+    if result.get("errors") or not result.get("data", {}).get("addLabelsToLabelable"):
+        raise ValueError("Could not apply accepted-work label with evidence")
+
+
+def assignment_failure_comment(message: str, run_url: str = "") -> str:
+    """Return the PR comment body for a failed reviewer request or removal."""
+    rerun = f"re-run the [workflow]({run_url})" if run_url else "re-run the check"
+    return (
+        f"{ASSIGNMENT_MARKER}\n"
+        "Review Readiness could not update reviewer requests for this PR. "
+        "This does not fail the check. A maintainer can request reviewers "
+        f"directly, or fix the cause and {rerun}.\n\n"
+        f"```text\n{message}\n```\n"
+    )
+
+
+def _note_assignment_failure(repository: str, number: int, message: str) -> None:
+    """Create or update the single assignment-failure comment on the PR."""
+    root = f"repos/{repository}"
+    server, run = os.environ.get("GITHUB_SERVER_URL"), os.environ.get("GITHUB_RUN_ID")
+    run_url = f"{server}/{repository}/actions/runs/{run}" if server and run else ""
+    body = assignment_failure_comment(message, run_url)
+    comments = _api(f"{root}/issues/{number}/comments?per_page=100", pages=True)
+    existing = next(
+        (
+            comment
+            for comment in comments
+            if (comment.get("user") or {}).get("type") == "Bot"
+            and (comment.get("body") or "").startswith(ASSIGNMENT_MARKER)
+        ),
+        None,
+    )
+    if existing:
+        _api(
+            f"{root}/issues/comments/{existing['id']}",
+            method="PATCH",
+            data={"body": body},
+        )
+    else:
+        _api(f"{root}/issues/{number}/comments", method="POST", data={"body": body})
+
+
+def _apply_review_requests(
+    repository: str, number: int, pr: dict, selected: set[str], plan: ReviewPlan
+) -> ReviewPlan:
+    pull = f"repos/{repository}/pulls/{number}"
+    endpoint = f"{pull}/requested_reviewers"
+    if plan.add:
+        _api(endpoint, method="POST", data={"reviewers": list(plan.add)})
+    if plan.remove:
+        # Re-read human choices and engagement immediately before removals.
+        latest = _api(pull)
+        if _routing_key(latest) != _routing_key(pr):
+            raise ValueError("PR routing changed; rerun reconciliation")
+        refreshed = plan_review_requests(
+            selected, **_load_reviewers(repository, number, latest)
+        )
+        plan = replace(plan, remove=refreshed.remove)
+        if plan.remove:
+            _api(endpoint, method="DELETE", data={"reviewers": list(plan.remove)})
+    return plan
+
+
 def check_review_readiness(
     categories: dict[str, set[str]],
     repository: str,
@@ -235,17 +430,21 @@ def check_review_readiness(
     add_labels = ()
     labels = {label["name"] for label in pr["labels"]}
     if label_accepted_work:
-        accepted = check_pr_accepted_work(
+        evidence = evaluate_pr_accepted_work(
             repository, pr, maintainers or set(), api=_api
         )
+        accepted = evidence is not None
         if accepted and ACCEPTED_LABEL not in labels:
             add_labels = (ACCEPTED_LABEL,)
             if apply:
-                _api(
-                    f"repos/{repository}/issues/{number}/labels",
-                    method="POST",
-                    data={"labels": list(add_labels)},
-                )
+                _add_accepted_label(repository, pr, evidence)
+    if needs_maintainer_edits(pr, repository):
+        raise MaintainerEditsError(
+            "Allow edits by maintainers is off, so this PR is not ready for review. "
+            "Turn on 'Allow edits by maintainers' in the PR sidebar, or run "
+            f"`gh api -X PATCH {pull} -F maintainer_can_modify=true`, then re-run "
+            "this check. Create PRs with `gh pr create`, which enables it by default."
+        )
     if pr["draft"] or not any(label.startswith("area:") for label in labels):
         if pr["draft"] and not label_accepted_work:
             return None
@@ -258,20 +457,16 @@ def check_review_readiness(
         add_labels=add_labels,
     )
     if apply:
-        endpoint = f"{pull}/requested_reviewers"
-        if plan.add:
-            _api(endpoint, method="POST", data={"reviewers": list(plan.add)})
-        if plan.remove:
-            # Re-read human choices and engagement immediately before removals.
-            latest = _api(pull)
-            if _routing_key(latest) != _routing_key(pr):
-                raise ValueError("PR routing changed; rerun reconciliation")
-            refreshed = plan_review_requests(
-                selected, **_load_reviewers(repository, number, latest)
-            )
-            plan = replace(plan, remove=refreshed.remove)
-            if plan.remove:
-                _api(endpoint, method="DELETE", data={"reviewers": list(plan.remove)})
+        try:
+            plan = _apply_review_requests(repository, number, pr, selected, plan)
+        except subprocess.CalledProcessError as exc:
+            # Roster or GitHub problems are not the PR's fault; note them instead.
+            message = describe_failure(exc)[1]
+            try:
+                _note_assignment_failure(repository, number, message)
+            except (subprocess.CalledProcessError, ValueError) as comment_exc:
+                message += f" {describe_failure(comment_exc)[1]}"
+            plan = replace(plan, assignment_error=message)
     return plan
 
 
@@ -315,8 +510,10 @@ def main(argv: list[str] | None = None) -> int:
         TypeError,
         subprocess.CalledProcessError,
     ) as exc:
-        print(f"Review readiness: {exc}", file=sys.stderr)
+        report_failure(exc)
         return 1
+    if plan is not None and plan.assignment_error:
+        report_assignment_failure(plan.assignment_error)
     print(
         json.dumps(
             asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}

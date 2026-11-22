@@ -952,6 +952,7 @@ mod tests {
             .unwrap();
         assert!(collector.tls().client_identity().is_some());
         let otlp = OtlpConfig {
+            metrics: None,
             service_name: None,
             traces: Some(OtlpTracesConfig { collector }),
             ocsf: None,
@@ -984,6 +985,7 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
+                metrics: None,
                 service_name: Some("custom-gateway".to_string()),
                 traces: Some(OtlpTracesConfig {
                     collector: OtlpCollectorConfig::new(
@@ -1016,6 +1018,7 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
+                metrics: None,
                 service_name: None,
                 traces: Some(OtlpTracesConfig {
                     collector: OtlpCollectorConfig::new(
@@ -1050,6 +1053,7 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
+                metrics: None,
                 service_name: None,
                 traces: None,
                 ocsf: Some(OcsfOtlpConfig {
@@ -1088,6 +1092,7 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
+                metrics: None,
                 service_name: None,
                 traces: None,
                 ocsf: None,

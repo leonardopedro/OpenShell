@@ -16,6 +16,7 @@ async fn paired_credential_denial_shares_one_deny_span() {
             443,
             "credential-policy",
             &tracing::Span::none(),
+            None,
         );
     })
     .await;
@@ -38,6 +39,7 @@ async fn repeated_credential_denials_keep_decision_spans_separate() {
                     443,
                     "credential-policy",
                     &connect,
+                    None,
                 );
             }
             let allowed = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -110,6 +112,7 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 binary_pid: None,
                 ancestors: vec![],
                 cmdline_paths: vec![],
+                process: None,
             };
             let denial = DestinationDenial {
                 kind: DestinationDenialKind::InternalAddress,
@@ -126,11 +129,10 @@ async fn forward_denials_use_the_saved_connect_parent() {
                 443,
                 "/",
                 "curl",
-                "42",
-                "-",
-                "curl",
+                &Process::from_bypass("curl", "42", "-").with_cmd_line("curl"),
                 "forward-policy",
                 &decision,
+                None,
                 None,
                 None,
             ))
@@ -194,7 +196,7 @@ async fn forward_evaluation_error_keeps_the_http_decision_policy_context() {
                     "evaluation unavailable",
                 );
                 // Use the same grouping as the forward-proxy production path.
-                emit_forward_l7_decision(decision, Some(error), &connect);
+                emit_forward_l7_decision(decision, Some(error), &connect, None);
             })
             .await;
 
