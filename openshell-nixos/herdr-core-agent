@@ -42,9 +42,15 @@ if [[ "${1-}" == "__runner" ]]; then
   [[ $# -ge 1 ]] || die "runner needs a terminal name"
   shift # the name is only used for the status message
   emit_status idle
-  trap 'emit_status done' EXIT
+  # Never let a generic EXIT trap report success. The child's status decides.
+  interrupted() { emit_status error; exit 130; }
+  trap interrupted INT TERM HUP
+  set +e
   "$@"
-  exit $?
+  rc=$?
+  set -e
+  if (( rc == 0 )); then emit_status done; else emit_status error; fi
+  exit "$rc"
 fi
 
 HC="$(resolve_hc)" || die "cannot find hc (install herdr-core or set HC_BIN)"

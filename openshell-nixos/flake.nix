@@ -47,15 +47,12 @@
         # /etc/nixos module can consume the same file without a flake ref
         # (one source; no second copy to drift).
         openshell = pkgs.callPackage ./openshell-package.nix { };
-<<<<<<< HEAD
-=======
 
         # herdr-core (`hc`) from the pinned official release tarball (the
         # pinned nixpkgs predates it). Herdr TUI comes from nixpkgs: it is the
         # same 0.9.5 source as ../herdr, without pinning that checkout here.
         herdr-core = pkgs.callPackage ./herdr-core-package.nix { };
         herdr = pkgs.herdr;
->>>>>>> 6bdbe06b0c401cdd2d706aba236fa0990f7da6c5
 
         # Everything needed to drive the fleet from a project folder. Freebuff
         # and the Infinity --release binaries stay external: Freebuff's native

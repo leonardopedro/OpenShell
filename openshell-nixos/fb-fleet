@@ -1,82 +1,233 @@
 #!/usr/bin/env bash
 # fb-fleet — one OpenShell VM per laptop, many agent sessions inside it.
 #
-# Stages per-session Freebuff Starter state, bakes the Infinity harness into
-# the Nix store, creates a single libkrun+DAX sandbox, and starts one
-# herdr-core terminal per session via `openshell sandbox exec`.
+#   ./fb-fleet --plan              # default: validate and print, write nothing
+#   ./fb-fleet --apply             # stage, reconcile the VM, start terminals
+#   ./fb-fleet --apply --json      # machine-readable result
+#   FB_SESSIONS=fb-a,fb-b ./fb-fleet --plan
 #
-#   ./fb-fleet                       # 3 Freebuff + 1 Infinity, laptop-1 slice
-#   FB_SESSIONS=fb-a,fb-b ./fb-fleet
-#   DRY_RUN=1 ./fb-fleet             # print the commands only
+# Safety properties:
+#   * plan (the default) performs no writes and reads no credentials or keys;
+#   * apply holds a lock and records the VM ID before any terminal starts;
+#   * an existing VM must report the same ID, provider, policy hash and mounts;
+#   * a terminal is started only after the exact sandbox ID is Ready;
+#   * retries reconcile by name and recorded state, never by blind relaunch.
 #
 # First-run requirements (see fleet-plan.md):
-#   * approve egress once per session binary (use fleet-policy.yaml; Freebuff
-#     calls www.codebuff.com in addition to freebuff.com):
-#       openshell policy update <VM> --add-endpoint www.codebuff.com:443 \
-#         --binary /workspace/<session>/.config/manicode/freebuff
-#   * Freebuff credentials are keyring-backed on the host, so copying
-#     credentials.json into the guest does not authenticate: each session
-#     needs one interactive device login (the link is on its hc screen).
+#   * approve egress once per session binary (fleet-policy.yaml for fb-1..3);
+#   * credentials are keyring-backed: each new session needs one interactive
+#     device login on its hc screen. This launcher never copies credentials.
 set -euo pipefail
 
 die() { printf 'fb-fleet: %s\n' "$*" >&2; exit 1; }
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+say() { printf 'fb-fleet: %s\n' "$*" >&2; }
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 resolve_bin() {
   if [[ "$1" == */* ]]; then printf '%s' "$1"; else command -v "$1" || true; fi
 }
+
+MODE=plan
+JSON=0
+for arg in "$@"; do
+  case "$arg" in
+    --plan|plan) MODE=plan ;;
+    --apply|apply) MODE=apply ;;
+    --json) JSON=1 ;;
+    -h|--help)
+      sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) die "unknown argument: $arg" ;;
+  esac
+done
+# Backwards-compatible explicit dry run remains a plan.
+if [[ "${DRY_RUN:-0}" == 1 ]]; then MODE=plan; fi
+
 OSH="$(resolve_bin "${OSH:-openshell}")"
 HC="$(resolve_bin "${HC:-hc}")"
 FLEET_DIR="${FLEET_DIR:-$HOME/fleet}"
 SANDBOX_NAME="${SANDBOX_NAME:-fleet}"
-FB_SESSIONS="${FB_SESSIONS:-fb-1,fb-2,fb-3}"
-INF_SESSIONS="${INF_SESSIONS:-inf-1}"
+FB_SESSIONS="${FB_SESSIONS-fb-1,fb-2,fb-3}"
+INF_SESSIONS="${INF_SESSIONS-inf-1}"
 INFINITY_TASK="${INFINITY_TASK:-Reply with exactly: PONG. Nothing else.}"
 MANICODE_SRC="${MANICODE_SRC:-$HOME/.config/manicode}"
-INFINITY_BIN_DIR="${INFINITY_BIN_DIR:-$SCRIPT_DIR/../../infinity/target/release}"
-EDGE0_API_KEY_FILE="${EDGE0_API_KEY_FILE:-$HOME/.edge0/api-key}"
+FREEBUFF_BIN="${FREEBUFF_BIN:-$MANICODE_SRC/freebuff}"
+INFINITY_BIN_DIR="${INFINITY_BIN_DIR:-$SCRIPT_DIR/../../Infinity/target/release}"
 PROVIDER="${PROVIDER:-edge0-gpu}"
-POLICY="${POLICY:-$SCRIPT_DIR/sandbox-policy.yaml}"
+POLICY="${POLICY:-$SCRIPT_DIR/fleet-policy.yaml}"
+READY_TIMEOUT="${READY_TIMEOUT:-20}"
 
-[[ -x "$OSH" ]] || die "openshell binary missing: $OSH"
-[[ -x "$HC" ]] || die "hc binary missing: $HC"
-[[ -x "$MANICODE_SRC/freebuff" ]] || die "no native freebuff binary at $MANICODE_SRC/freebuff (run freebuff once on the host)"
-for bin in infinity infinity-provider-openai sandbox-local; do
-  [[ -x "$INFINITY_BIN_DIR/$bin" ]] || die "$INFINITY_BIN_DIR/$bin missing (cargo build --release in ../infinity)"
-done
+STATE_DIR="$FLEET_DIR/.fleet"
+VM_RECORD="$STATE_DIR/vm.env"
+SHARED_BIN="$STATE_DIR/bin/freebuff"
+SHARED_INFINITY="$STATE_DIR/infinity/bin"
 
-mkdir -p "$FLEET_DIR"
-
-# ── Stage per-session state on the host (workspace is the only rw share) ──
 IFS=',' read -r -a FB <<< "$FB_SESSIONS"
 IFS=',' read -r -a INF <<< "$INF_SESSIONS"
+ALL=("${FB[@]}" "${INF[@]}")
 
+# ── validation (no writes, no secret reads) ────────────────────────────────
+[[ "$SANDBOX_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
+  die "bad sandbox name: $SANDBOX_NAME"
+(( ${#ALL[@]} > 0 )) || die "no sessions configured"
+declare -A SEEN=()
+for s in "${ALL[@]}"; do
+  [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "bad session name: $s"
+  [[ -z "${SEEN[$s]:-}" ]] || die "duplicate session name: $s"
+  SEEN[$s]=1
+done
+
+policy_sha="missing"
+[[ -f "$POLICY" ]] && policy_sha="$(sha256sum "$POLICY" | cut -d' ' -f1)"
+mounts="/nix:/nix:ro,$FLEET_DIR:/workspace:rw"
+
+stale_policy=0
+if [[ -f "$POLICY" ]]; then
+  for s in "${FB[@]}"; do
+    grep -Fq "path: /workspace/$s/.config/manicode/freebuff" "$POLICY" || stale_policy=1
+  done
+fi
+
+get_field() {
+  local output="$1" key="$2"
+  if [[ "$output" == \{* ]]; then
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" <<< "$output" | head -1
+  else
+    local token
+    for token in $output; do
+      [[ "$token" == "$key="* ]] && { printf '%s\n' "${token#*=}"; return; }
+    done
+  fi
+}
+
+vm_record() { # key
+  [[ -f "$VM_RECORD" ]] || return 0
+  sed -n "s/^$1=//p" "$VM_RECORD" | head -1
+}
+
+session_state() { # session key
+  [[ -f "$STATE_DIR/$1.state" ]] || return 0
+  sed -n "s/^$2=//p" "$STATE_DIR/$1.state" | head -1
+}
+
+hc_has() { # terminal name
+  "$HC" ls 2>/dev/null | grep -Eq "(^|[[:space:]])$1([[:space:]]|$)"
+}
+
+write_atomic() { # path content
+  local tmp="$1.tmp.$$"
+  printf '%s\n' "$2" > "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+record_vm() { # id
+  write_atomic "$VM_RECORD" "name=$SANDBOX_NAME
+id=$1
+provider=$PROVIDER
+policy_sha=$policy_sha
+mounts=$mounts"
+}
+
+record_session() { # session status
+  write_atomic "$STATE_DIR/$1.state" "session=$1
+kind=$2
+status=$3
+sandbox=$SANDBOX_NAME
+vm_id=${VM_ID:-}
+terminal=$1
+updated=$(date +%s)"
+}
+
+plan_action() {
+  case "$1" in
+    fb-*) printf 'stage-freebuff+terminal' ;;
+    inf-*) printf 'stage-infinity+terminal' ;;
+  esac
+}
+
+print_plan() {
+  local vm_action=create
+  [[ -n "$(vm_record id)" ]] && vm_action=reuse
+  if (( stale_policy )); then vm_action="reject-stale-policy"; fi
+  if [[ ! -x "$FREEBUFF_BIN" && ! -x "$SHARED_BIN" ]] && (( ${#FB[@]} > 0 )); then
+    vm_action="reject-missing-freebuff"
+  fi
+  if [[ "$JSON" == 1 ]]; then
+    local first=1
+    printf '{"version":1,"mode":"plan","sandbox":"%s","vm":{"action":"%s","id":"%s","provider":"%s","policy_sha":"%s","mounts":"%s"},"sessions":[' \
+      "$SANDBOX_NAME" "$vm_action" "$(vm_record id)" "$PROVIDER" "$policy_sha" "$mounts"
+    for s in "${ALL[@]}"; do
+      (( first )) || printf ','
+      first=0
+      printf '{"name":"%s","kind":"%s","action":"%s","status":"%s"}' \
+        "$s" "$( [[ "$s" == fb-* ]] && echo freebuff || echo infinity )" \
+        "$(plan_action "$s")" "$(session_state "$s" status)"
+    done
+    printf ']}\n'
+  else
+    printf 'fb-fleet plan: sandbox=%s vm=%s provider=%s policy=%s\n' \
+      "$SANDBOX_NAME" "$vm_action" "$PROVIDER" "${policy_sha:0:12}"
+    printf '  mounts: %s\n' "$mounts"
+    for s in "${ALL[@]}"; do
+      printf '  %-8s %-11s state=%s\n' "$s" "$(plan_action "$s")" "$(session_state "$s" status)"
+    done
+    (( stale_policy )) && printf '  warning: fleet-policy.yaml is missing a Freebuff session path\n'
+    printf '  no writes performed; run with --apply to execute\n'
+  fi
+}
+
+[[ "$MODE" == plan ]] && { print_plan; exit 0; }
+
+# ── apply ─────────────────────────────────────────────────────────────────
+[[ -x "$OSH" ]] || die "openshell binary missing: $OSH"
+[[ -x "$HC" ]] || die "hc binary missing: $HC"
+[[ -f "$POLICY" ]] || die "policy file not found: $POLICY"
+(( stale_policy == 0 )) || die "stale fleet-policy.yaml: every Freebuff session needs its binary path"
 for s in "${FB[@]}"; do
-  [[ "$s" =~ ^[a-zA-Z0-9_-]+$ ]] || die "bad session name: $s"
-  mkdir -p "$FLEET_DIR/$s/.config" "$FLEET_DIR/$s/repo"
-  # cp -a (not hardlinks): concurrent sessions must not share writes.
-  rm -rf "$FLEET_DIR/$s/.config/manicode"
-  cp -a "$MANICODE_SRC" "$FLEET_DIR/$s/.config/manicode"
+  [[ -x "$FREEBUFF_BIN" || -x "$SHARED_BIN" ]] ||
+    die "no shared Freebuff binary at $FREEBUFF_BIN (run freebuff once on the host)"
 done
+if (( ${#INF[@]} > 0 )); then
+  for bin in infinity infinity-provider-openai sandbox-local; do
+    [[ -x "$INFINITY_BIN_DIR/$bin" ]] ||
+      die "missing $INFINITY_BIN_DIR/$bin (build the exact case-sensitive release path)"
+  done
+fi
 
-# ── Bake Infinity into the Nix store (shared into the VM via /nix) ─────────
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/fb-fleet.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/infinity/bin"
-for bin in infinity infinity-provider-openai sandbox-local; do
-  cp "$INFINITY_BIN_DIR/$bin" "$STAGE/infinity/bin/$bin"
-done
-chmod 0755 "$STAGE/infinity/bin/"*
-INFINITY_STORE="$(cd "$SCRIPT_DIR" && nix store add-path "$STAGE/infinity")"
-[[ -x "$INFINITY_STORE/bin/infinity" ]] || die "store bake failed"
+mkdir -p "$STATE_DIR/bin" "$FLEET_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || die "another apply is running for $FLEET_DIR"
 
-for s in "${INF[@]}"; do
-  mkdir -p "$FLEET_DIR/$s/.infinity"
-  cat > "$FLEET_DIR/$s/.infinity/providers.json" <<EOF
+# Shared Freebuff binary. Session homes never source a mutable host HOME.
+if [[ -x "$FREEBUFF_BIN" ]] && ! cmp -s "$FREEBUFF_BIN" "$SHARED_BIN"; then
+  install -Dm755 "$FREEBUFF_BIN" "$SHARED_BIN"
+fi
+[[ -x "$SHARED_BIN" ]] || die "shared Freebuff binary was not staged"
+
+stage_freebuff() { # session
+  local s="$1" home="$FLEET_DIR/$1/.config/manicode"
+  mkdir -p "$home" "$FLEET_DIR/$s/repo"
+  # Credentials and history are preserved; only the program is replaced.
+  if ! ln -f "$SHARED_BIN" "$home/freebuff" 2>/dev/null; then
+    install -m755 "$SHARED_BIN" "$home/freebuff"
+  fi
+}
+
+stage_infinity() {
+  (( ${#INF[@]} == 0 )) && return 0
+  mkdir -p "$SHARED_INFINITY"
+  for bin in infinity infinity-provider-openai sandbox-local; do
+    if ! cmp -s "$INFINITY_BIN_DIR/$bin" "$SHARED_INFINITY/$bin"; then
+      install -m755 "$INFINITY_BIN_DIR/$bin" "$SHARED_INFINITY/$bin"
+    fi
+  done
+  for s in "${INF[@]}"; do
+    mkdir -p "$FLEET_DIR/$s/.infinity"
+    cat > "$FLEET_DIR/$s/.infinity/providers.json" <<EOF
 {
   "edge0": {
     "command": [
-      "$INFINITY_STORE/bin/infinity-provider-openai",
+      "$SHARED_INFINITY/infinity-provider-openai",
       "--base-url", "http://host.openshell.internal:8001/v1",
       "--model", "edge0_35b",
       "--context-window", "16384"
@@ -84,48 +235,101 @@ for s in "${INF[@]}"; do
   }
 }
 EOF
-  printf '{"tool_sets":[]}\n' > "$FLEET_DIR/$s/.infinity/rap.json"
-done
-
-# ── One VM: /nix ro + project dir rw ───────────────────────────────────────
-DRIVER_CONFIG="{\"vm\":{\"mounts\":[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},{\"type\":\"bind\",\"source\":\"$FLEET_DIR\",\"target\":\"/workspace\",\"read_only\":false}]}}"
-export INFINITY_OPENAI_API_KEY="$(cat "$EDGE0_API_KEY_FILE")"
-CREATE=(
-  "$OSH" sandbox create --name "$SANDBOX_NAME"
-  --driver-config-json "$DRIVER_CONFIG"
-  --policy "$POLICY"
-  --provider "$PROVIDER"
-  --env-from INFINITY_OPENAI_API_KEY
-  -- sh -c 'sleep infinity'
-)
-
-# ── One hc terminal per session, exec'ing into that VM ─────────────────────
-run_cmd() {
-  if [[ "${DRY_RUN:-0}" == 1 ]]; then
-    printf '%q ' "$@"; printf '\n'
-  else
-    "$@"
-  fi
+    printf '{"tool_sets":[]}\n' > "$FLEET_DIR/$s/.infinity/rap.json"
+  done
 }
 
-if [[ "${DRY_RUN:-0}" == 1 ]]; then
-  printf '%q ' "${CREATE[@]}"; printf '\n'
+for s in "${FB[@]}"; do stage_freebuff "$s"; done
+stage_infinity
+
+DRIVER_CONFIG="{\"vm\":{\"mounts\":[{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true},{\"type\":\"bind\",\"source\":\"$FLEET_DIR\",\"target\":\"/workspace\",\"read_only\":false}]}}"
+
+get_vm() { # sets VM_OUT, VM_ID, VM_STATE
+  VM_OUT="$("$OSH" sandbox get "$SANDBOX_NAME" 2>/dev/null || true)"
+  if [[ -z "$(get_field "$VM_OUT" id)" ]]; then
+    local json
+    json="$("$OSH" sandbox get "$SANDBOX_NAME" --json 2>/dev/null || true)"
+    [[ -n "$json" ]] && VM_OUT="$json"
+  fi
+  VM_ID="$(get_field "$VM_OUT" id)"
+  VM_STATE="$(get_field "$VM_OUT" state)"
+}
+
+# Reconcile an existing VM before creating anything.
+VM_ID=""
+get_vm
+recorded="$(vm_record id)"
+if [[ -n "$VM_ID" ]]; then
+  [[ -z "$recorded" || "$recorded" == "$VM_ID" ]] ||
+    die "wrong VM: $SANDBOX_NAME reports $VM_ID, recorded $recorded"
+  [[ "$(get_field "$VM_OUT" provider)" == "$PROVIDER" ]] ||
+    die "VM $VM_ID has the wrong provider (want $PROVIDER)"
+  [[ "$(get_field "$VM_OUT" policy_sha)" == "$policy_sha" ]] ||
+    die "VM $VM_ID has a stale policy hash"
+  [[ "$(get_field "$VM_OUT" mounts)" == "$mounts" ]] ||
+    die "VM $VM_ID has unexpected mounts"
 fi
 
-# `sandbox create` waits for its command; give it a bounded wait and verify.
-if [[ "${DRY_RUN:-0}" != 1 ]]; then
-  timeout 20 "${CREATE[@]}" >&2 || true
-  "$OSH" sandbox get "$SANDBOX_NAME" 2>&1 | head -c 400 >&2 || true
+if [[ -z "$VM_ID" || "$VM_STATE" != ready ]]; then
+  if [[ -z "$VM_ID" ]]; then
+    "$OSH" sandbox create --name "$SANDBOX_NAME" \
+      --driver-config-json "$DRIVER_CONFIG" --policy "$POLICY" --provider "$PROVIDER" \
+      -- sh -c 'sleep infinity' >/dev/null 2>&1 || true
+  fi
+  deadline=$(( $(date +%s) + READY_TIMEOUT ))
+  while :; do
+    get_vm
+    [[ "${DEBUG:-0}" == 1 ]] && say "inspect: id='$VM_ID' state='$VM_STATE' out='$VM_OUT'"
+    [[ -n "$VM_ID" && "$VM_STATE" == ready ]] && break
+    (( $(date +%s) < deadline )) || die "sandbox $SANDBOX_NAME was not Ready with a verified ID"
+    sleep 0.5
+  done
 fi
+
+# An existing ready VM must pass the same exact checks after a create wait.
+[[ -z "$recorded" || "$recorded" == "$VM_ID" ]] || die "VM ID changed during reconciliation"
+[[ "$(get_field "$VM_OUT" provider)" == "$PROVIDER" ]] || die "VM provider mismatch"
+[[ "$(get_field "$VM_OUT" policy_sha)" == "$policy_sha" ]] || die "VM policy mismatch"
+[[ "$(get_field "$VM_OUT" mounts)" == "$mounts" ]] || die "VM mounts mismatch"
+record_vm "$VM_ID"
+
+# No terminal exists before this point. Record the intent before launching so
+# a crash leaves a reconcilable name, then check hc for that name on retry.
+launch() { # session kind guest-command...
+  local s="$1" kind="$2"; shift 2
+  if ! hc_has "$s"; then
+    record_session "$s" "$kind" launching
+    if ! "$HC" run --bg --name "$s" -- "$@"; then
+      record_session "$s" "$kind" uncertain
+      die "terminal $s may have started; retry will reconcile by name"
+    fi
+  fi
+  record_session "$s" "$kind" running
+}
 
 for s in "${FB[@]}"; do
-  run_cmd "$HC" run --bg --name "$s" -- "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
+  launch "$s" freebuff "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
     env "HOME=/workspace/$s" "/workspace/$s/.config/manicode/freebuff"
 done
 for s in "${INF[@]}"; do
-  run_cmd "$HC" run --bg --name "$s" -- "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
-    env "HOME=/workspace/$s" "$INFINITY_STORE/bin/infinity" --initial-message "$INFINITY_TASK"
+  launch "$s" infinity "$OSH" sandbox exec --tty "$SANDBOX_NAME" -- \
+    env "HOME=/workspace/$s" "$SHARED_INFINITY/infinity" --initial-message "$INFINITY_TASK"
 done
 
-printf 'fb-fleet: VM %s ready; %d Freebuff + %d Infinity terminals started.\n' \
-  "$SANDBOX_NAME" "${#FB[@]}" "${#INF[@]}" >&2
+if [[ "$JSON" == 1 ]]; then
+  printf '{"version":1,"mode":"apply","sandbox":"%s","vm":{"id":"%s","provider":"%s"},"sessions":[' \
+    "$SANDBOX_NAME" "$VM_ID" "$PROVIDER"
+  first=1
+  for s in "${ALL[@]}"; do
+    (( first )) || printf ','
+    first=0
+    printf '{"name":"%s","status":"%s"}' "$s" "$(session_state "$s" status)"
+  done
+  printf ']}\n'
+else
+  say "VM $SANDBOX_NAME ($VM_ID) Ready; ${#FB[@]} Freebuff + ${#INF[@]} Infinity terminals reconciled."
+  for s in "${FB[@]}"; do
+    [[ -f "$FLEET_DIR/$s/.config/manicode/credentials.json" ]] ||
+      say "$s needs one interactive device login in its hc terminal"
+  done
+fi
